@@ -1,0 +1,9 @@
+<RCC>
+  <qresource prefix="/icons">
+    <file>../assets/app.ico</file>
+    <file>../assets/chevron-down.svg</file>
+    <file>../assets/chevron-down.png</file>
+    <file>../assets/volume.svg</file>
+    <file>../assets/volume-muted.svg</file>
+  </qresource>
+</RCC>
