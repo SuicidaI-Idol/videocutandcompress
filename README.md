@@ -8,7 +8,7 @@ Simple Windows desktop app to cut, preview, and compress videos with FFmpeg thro
 
 ## Install
 
-1. Download [`VideoCutCompress-Setup.exe`](https://github.com/SuicidaI-Idol/videocutandcompress/releases/latest/download/VideoCutCompress-Setup.exe).
+1. Download [`VideoCutCompress-Setup.exe`](https://github.com/SuicidaI-Idol/videocutandcompress/raw/main/dist/VideoCutCompress-Setup.exe).
 2. Run the installer.
 3. Launch **Video Cut and Compress** from the Start menu or desktop shortcut.
 
