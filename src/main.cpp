@@ -2,10 +2,16 @@
 #include <QtCore/QDateTime>
 #include <QtCore/QDir>
 #include <QtCore/QFileInfo>
+#include <QtCore/QJsonArray>
+#include <QtCore/QJsonDocument>
+#include <QtCore/QJsonObject>
 #include <QtCore/QMap>
+#include <QtCore/QMimeData>
 #include <QtCore/QProcess>
 #include <QtCore/QRegularExpression>
+#include <QtCore/QSet>
 #include <QtCore/QSettings>
+#include <QtCore/QSignalBlocker>
 #include <QtCore/QStandardPaths>
 #include <QtCore/QTemporaryDir>
 #include <QtCore/QThread>
@@ -14,16 +20,23 @@
 #include <QtCore/QUuid>
 #include <QtGui/QCloseEvent>
 #include <QtGui/QDesktopServices>
+#include <QtGui/QDragEnterEvent>
 #include <QtGui/QIcon>
 #include <QtGui/QMouseEvent>
 #include <QtGui/QPainter>
 #include <QtGui/QPainterPath>
 #include <QtGui/QPixmap>
 #include <QtGui/QResizeEvent>
+#include <QtMultimedia/QAudioBuffer>
+#include <QtMultimedia/QAudioBufferOutput>
 #include <QtMultimedia/QAudioOutput>
+#include <QtMultimedia/QAudioSink>
+#include <QtMultimedia/QMediaMetaData>
 #include <QtMultimedia/QMediaPlayer>
 #include <QtMultimediaWidgets/QVideoWidget>
+#include <QtWidgets/QAbstractItemView>
 #include <QtWidgets/QApplication>
+#include <QtWidgets/QCheckBox>
 #include <QtWidgets/QComboBox>
 #include <QtWidgets/QFileDialog>
 #include <QtWidgets/QFrame>
@@ -31,13 +44,14 @@
 #include <QtWidgets/QHBoxLayout>
 #include <QtWidgets/QLabel>
 #include <QtWidgets/QLineEdit>
+#include <QtWidgets/QListWidget>
 #include <QtWidgets/QMainWindow>
 #include <QtWidgets/QProgressBar>
 #include <QtWidgets/QPushButton>
 #include <QtWidgets/QSizePolicy>
 #include <QtWidgets/QSlider>
-#include <QtWidgets/QStyleOptionSlider>
 #include <QtWidgets/QStyle>
+#include <QtWidgets/QStyleOptionSlider>
 #include <QtWidgets/QVBoxLayout>
 #include <QtWidgets/QWidget>
 
@@ -137,6 +151,149 @@ struct MediaInfo {
   bool ok = false;
 };
 
+// Soft exponential volume curve: 100% = 1x, 150% = 2x, 200% = 4x
+inline float sliderToGain(int sliderValue) {
+  if (sliderValue <= 0)
+    return 0.0f;
+  return std::pow(2.0f, (sliderValue - 100) / 50.0f);
+}
+
+// ---------------------------------------------------------------------------
+// GainAudioSink — replaces QAudioOutput and applies software gain (0.0–2.0+)
+// Uses QAudioBufferOutput to intercept raw PCM buffers from QMediaPlayer,
+// applies per-sample gain, then writes to QAudioSink.
+// ---------------------------------------------------------------------------
+class GainAudioSink : public QObject {
+  Q_OBJECT
+public:
+  explicit GainAudioSink(QObject *parent = nullptr) : QObject(parent) {}
+  ~GainAudioSink() { detach(); }
+
+  void attachTo(QMediaPlayer *player) {
+    detach();
+    player_ = player;
+    connect(player_, &QObject::destroyed, this,
+            [this]() { player_ = nullptr; });
+    bufferOutput_ = new QAudioBufferOutput(this);
+    player_->setAudioBufferOutput(bufferOutput_);
+    connect(bufferOutput_, &QAudioBufferOutput::audioBufferReceived, this,
+            &GainAudioSink::onBuffer);
+  }
+
+  void detach() {
+    if (player_) {
+      player_->setAudioBufferOutput(nullptr);
+      player_ = nullptr;
+    }
+    if (bufferOutput_) {
+      bufferOutput_->deleteLater();
+      bufferOutput_ = nullptr;
+    }
+    resetSink();
+  }
+
+  void setVolume(float vol) { volume_ = vol; }
+  float volume() const { return volume_; }
+  void setMuted(bool muted) { muted_ = muted; }
+  bool muted() const { return muted_; }
+
+private:
+  void resetSink() {
+    if (sink_) {
+      sink_->stop();
+      sink_->deleteLater();
+      sink_ = nullptr;
+      sinkDevice_ = nullptr;
+    }
+    lastFormat_ = {};
+  }
+
+  void onBuffer(const QAudioBuffer &buf) {
+    if (muted_ || volume_ < 0.001f)
+      return;
+    if (!buf.isValid() || buf.byteCount() == 0)
+      return;
+
+    if (!sink_ || lastFormat_ != buf.format()) {
+      resetSink();
+      lastFormat_ = buf.format();
+      sink_ = new QAudioSink(lastFormat_, this);
+      sink_->setBufferSize(buf.byteCount() * 8);
+      sinkDevice_ = sink_->start();
+    }
+    if (!sinkDevice_ || !sinkDevice_->isOpen())
+      return;
+
+    if (std::abs(volume_ - 1.0f) < 0.002f) {
+      sinkDevice_->write(
+          reinterpret_cast<const char *>(buf.constData<quint8>()),
+          buf.byteCount());
+      return;
+    }
+    QByteArray data(reinterpret_cast<const char *>(buf.constData<quint8>()),
+                    buf.byteCount());
+    applyGain(data, buf.format(), volume_);
+    sinkDevice_->write(data.constData(), data.size());
+  }
+
+  static float softClip(float x) { return std::tanh(x); }
+
+  static void applyGain(QByteArray &data, const QAudioFormat &fmt, float gain) {
+    switch (fmt.sampleFormat()) {
+    case QAudioFormat::Float: {
+      auto *s = reinterpret_cast<float *>(data.data());
+      const int n = data.size() / int(sizeof(float));
+      for (int i = 0; i < n; ++i)
+        s[i] = softClip(s[i] * gain);
+      break;
+    }
+    case QAudioFormat::Int16: {
+      auto *s = reinterpret_cast<int16_t *>(data.data());
+      const int n = data.size() / int(sizeof(int16_t));
+      for (int i = 0; i < n; ++i) {
+        const float v = softClip((s[i] / 32768.0f) * gain);
+        s[i] = static_cast<int16_t>(v * 32767.0f);
+      }
+      break;
+    }
+    case QAudioFormat::Int32: {
+      auto *s = reinterpret_cast<int32_t *>(data.data());
+      const int n = data.size() / int(sizeof(int32_t));
+      constexpr float sc = 2147483647.0f;
+      for (int i = 0; i < n; ++i) {
+        const float v = softClip((s[i] / 2147483648.0f) * gain);
+        s[i] = static_cast<int32_t>(v * sc);
+      }
+      break;
+    }
+    case QAudioFormat::UInt8: {
+      auto *s = reinterpret_cast<uint8_t *>(data.data());
+      const int n = data.size();
+      for (int i = 0; i < n; ++i) {
+        const float v = softClip(((s[i] - 128) / 128.0f) * gain);
+        s[i] = static_cast<uint8_t>(v * 127.0f + 128.0f);
+      }
+      break;
+    }
+    default:
+      break;
+    }
+  }
+
+  QMediaPlayer *player_ = nullptr;
+  QAudioBufferOutput *bufferOutput_ = nullptr;
+  QAudioSink *sink_ = nullptr;
+  QIODevice *sinkDevice_ = nullptr;
+  QAudioFormat lastFormat_;
+  float volume_ = 1.0f;
+  bool muted_ = false;
+};
+
+struct AudioTrackInfo {
+  int streamIndex = -1;
+  QString label;
+};
+
 struct Request {
   QString path;
   QString compressMode;
@@ -150,6 +307,7 @@ struct Request {
   int presetAudioKbps = 0;
   int presetWidthLimit = 0;
   QString presetFfmpegPreset = "medium";
+  QVector<int> selectedAudioStreamIndices;
 };
 
 QString padTime(const QString &value) {
@@ -217,6 +375,92 @@ MediaInfo getMediaInfo(const QString &path) {
   if (!okH)
     info.height = 0;
   return info;
+}
+
+static QString iso639ToName(const QString &code) {
+  static const QMap<QString, QString> map = {
+      {"eng", "English"},  {"en", "English"},     {"fre", "French"},
+      {"fra", "French"},   {"fr", "French"},      {"ger", "German"},
+      {"deu", "German"},   {"de", "German"},      {"spa", "Spanish"},
+      {"es", "Spanish"},   {"ita", "Italian"},    {"it", "Italian"},
+      {"jpn", "Japanese"}, {"ja", "Japanese"},    {"kor", "Korean"},
+      {"ko", "Korean"},    {"por", "Portuguese"}, {"pt", "Portuguese"},
+      {"rus", "Russian"},  {"ru", "Russian"},     {"chi", "Chinese"},
+      {"zho", "Chinese"},  {"zh", "Chinese"},     {"ara", "Arabic"},
+      {"ar", "Arabic"},    {"dut", "Dutch"},      {"nld", "Dutch"},
+      {"nl", "Dutch"},     {"pol", "Polish"},     {"pl", "Polish"},
+      {"tur", "Turkish"},  {"tr", "Turkish"},     {"swe", "Swedish"},
+      {"sv", "Swedish"},   {"nor", "Norwegian"},  {"no", "Norwegian"},
+      {"dan", "Danish"},   {"da", "Danish"},      {"fin", "Finnish"},
+      {"fi", "Finnish"},   {"heb", "Hebrew"},     {"he", "Hebrew"},
+      {"und", ""},         {"unk", ""},
+  };
+  const QString lower = code.toLower();
+  return map.value(lower, code);
+}
+
+QVector<AudioTrackInfo> getAudioTracks(const QString &path) {
+  QProcess p;
+  p.start(
+      "ffprobe",
+      {"-v", "error", "-select_streams", "a", "-show_entries",
+       "stream=index,codec_name,channels,bit_rate:stream_tags=language,title",
+       "-of", "json", path});
+  if (!p.waitForFinished(12000) || p.exitCode() != 0)
+    return {};
+
+  const auto doc = QJsonDocument::fromJson(p.readAllStandardOutput());
+  if (!doc.isObject())
+    return {};
+  const auto streams = doc.object().value("streams").toArray();
+  QVector<AudioTrackInfo> tracks;
+  tracks.reserve(streams.size());
+  int audioTrackNumber = 0;
+  for (const auto &value : streams) {
+    const auto obj = value.toObject();
+    AudioTrackInfo track;
+    track.streamIndex = obj.value("index").toInt(-1);
+    if (track.streamIndex < 0)
+      continue;
+    ++audioTrackNumber;
+
+    const QString codec = obj.value("codec_name").toString().toUpper();
+    const int channels = obj.value("channels").toInt(0);
+    const int bitrateKbps = obj.value("bit_rate").toString().toInt() / 1000;
+    const auto tags = obj.value("tags").toObject();
+    const QString langCode = tags.value("language").toString().trimmed();
+    const QString langName = iso639ToName(langCode);
+    const QString title = tags.value("title").toString().trimmed();
+
+    // Human-readable channel layout
+    QString chStr;
+    if (channels == 1)
+      chStr = "Mono";
+    else if (channels == 2)
+      chStr = "Stereo";
+    else if (channels == 6)
+      chStr = "5.1";
+    else if (channels == 8)
+      chStr = "7.1";
+    else if (channels > 0)
+      chStr = QString("%1 ch").arg(channels);
+
+    QStringList parts;
+    parts << QString("Track %1").arg(audioTrackNumber);
+    if (!langName.isEmpty())
+      parts << langName;
+    if (!title.isEmpty() && title.compare(langCode, Qt::CaseInsensitive) != 0)
+      parts << title;
+    if (!codec.isEmpty())
+      parts << codec;
+    if (!chStr.isEmpty())
+      parts << chStr;
+    if (bitrateKbps > 0)
+      parts << QString("%1 kb/s").arg(bitrateKbps);
+    track.label = parts.join("  ·  ");
+    tracks.push_back(track);
+  }
+  return tracks;
 }
 
 double parseSizeMb(const QString &value) {
@@ -337,9 +581,8 @@ protected:
 
     QStyleOptionSlider opt;
     initStyleOption(&opt);
-    const QRect grooveRect =
-        style()->subControlRect(QStyle::CC_Slider, &opt,
-                                QStyle::SC_SliderGroove, this);
+    const QRect grooveRect = style()->subControlRect(
+        QStyle::CC_Slider, &opt, QStyle::SC_SliderGroove, this);
     if (!grooveRect.isValid())
       return;
 
@@ -350,7 +593,8 @@ protected:
       if (value < minimum() || value > maximum())
         return;
       const int x = markerX(value, grooveRect);
-      const QRect lineRect(x - 1, grooveRect.top() - 8, 3, grooveRect.height() + 16);
+      const QRect lineRect(x - 1, grooveRect.top() - 8, 3,
+                           grooveRect.height() + 16);
       p.fillRect(lineRect, color);
 
       QPainterPath flag;
@@ -379,80 +623,8 @@ private:
   int endMarkerMs_ = -1;
 };
 
-class PreviewWorker : public QThread {
-  Q_OBJECT
-public:
-  PreviewWorker(QString sourcePath, QString startMmss, int durationSeconds,
-                int targetDuration, QObject *parent = nullptr)
-      : QThread(parent), sourcePath_(std::move(sourcePath)),
-        startMmss_(std::move(startMmss)), durationSeconds_(durationSeconds),
-        targetDuration_(qMax(targetDuration, 1)) {}
-
-signals:
-  void progress(int);
-  void status(const QString &);
-  void ready(const QString &, const QString &);
-  void failed(const QString &);
-
-protected:
-  void run() override {
-    QString tempDir =
-        QDir(QStandardPaths::writableLocation(QStandardPaths::TempLocation))
-            .filePath("video_cut_preview_qt_" +
-                      QUuid::createUuid().toString(QUuid::WithoutBraces));
-    QDir().mkpath(tempDir);
-    QString cutPath = QDir(tempDir).filePath("segment_preview.mp4");
-
-    QStringList cmd{"-y", "-ss", "00:" + startMmss_, "-i", sourcePath_};
-    if (durationSeconds_ > 0)
-      cmd << "-t" << QString::number(durationSeconds_);
-    cmd << "-c:v" << "libx264" << "-preset" << "veryfast" << "-crf" << "20"
-        << "-g" << "1" << "-keyint_min" << "1"
-        << "-sc_threshold" << "0" << "-bf" << "0" << "-c:a" << "aac"
-        << "-movflags" << "+faststart" << cutPath;
-
-    emit status("Creating preview...");
-    QProcess p;
-    p.start("ffmpeg", cmd);
-    if (!p.waitForStarted()) {
-      rmDir(tempDir);
-      emit failed("ffmpeg not found on this system");
-      return;
-    }
-
-    QString pending;
-    while (p.state() != QProcess::NotRunning) {
-      if (!p.waitForReadyRead(200))
-        continue;
-      pending += QString::fromUtf8(p.readAllStandardError());
-      int pos;
-      while ((pos = pending.indexOf('\n')) >= 0) {
-        QString line = pending.left(pos);
-        pending.remove(0, pos + 1);
-        int sec = parseFfmpegProgress(line);
-        if (sec >= 0)
-          emit progress(
-              qMin(static_cast<int>(
-                       (static_cast<double>(sec) / targetDuration_) * 100.0),
-                   99));
-      }
-    }
-    p.waitForFinished();
-    if (p.exitCode() != 0 || !QFileInfo::exists(cutPath)) {
-      rmDir(tempDir);
-      emit failed("Failed to create preview");
-      return;
-    }
-    emit progress(100);
-    emit ready(tempDir, cutPath);
-  }
-
-private:
-  QString sourcePath_;
-  QString startMmss_;
-  int durationSeconds_;
-  int targetDuration_;
-};
+// No PreviewWorker needed — multi-track audio is handled by auxiliary
+// QMediaPlayer instances playing in parallel with the main player.
 
 class CompressionWorker : public QThread {
   Q_OBJECT
@@ -482,12 +654,22 @@ protected:
   }
 
 private:
+  void appendSelectedAudioMaps(QStringList &cmd,
+                               const QVector<int> &streamIndices,
+                               const QString &inputPrefix = "0") const {
+    cmd << "-map" << inputPrefix + ":v:0?";
+    for (int streamIndex : streamIndices)
+      cmd << "-map" << QString("%1:%2").arg(inputPrefix).arg(streamIndex);
+  }
+
   QStringList buildPassCmd(const QString &path, int vk, int ak,
                            const QString &preset, int passNo,
-                           const QString &passlog, const QString &scale) const {
+                           const QString &passlog, const QString &scale,
+                           bool includeAudio) const {
     QStringList cmd{"-y", "-i", path};
     if (!scale.isEmpty())
       cmd << "-vf" << scale;
+    cmd << "-map" << "0:v:0?";
     cmd << "-c:v" << "libx264" << "-preset" << preset << "-b:v"
         << QString::number(vk) + "k" << "-maxrate"
         << QString::number(static_cast<int>(std::ceil(vk * 1.15))) + "k"
@@ -496,24 +678,30 @@ private:
         << "+faststart";
     if (passNo == 1)
       cmd << "-an" << "-f" << "mp4" << "NUL";
+    else if (includeAudio)
+      cmd << "-map" << "0:a?" << "-c:a" << "aac" << "-b:a"
+          << QString::number(ak) + "k" << outputPath_;
     else
-      cmd << "-c:a" << "aac" << "-b:a" << QString::number(ak) + "k"
-          << outputPath_;
+      cmd << "-an" << outputPath_;
     return cmd;
   }
 
   QStringList buildSinglePassCmd(const QString &path, int vk, int ak,
-                                 const QString &preset,
-                                 const QString &scale) const {
+                                 const QString &preset, const QString &scale,
+                                 bool includeAudio) const {
     QStringList cmd{"-y", "-i", path};
     if (!scale.isEmpty())
       cmd << "-vf" << scale;
-    cmd << "-c:v" << "libx264" << "-preset" << preset << "-b:v"
-        << QString::number(vk) + "k" << "-maxrate"
+    cmd << "-map" << "0:v:0?" << "-c:v" << "libx264" << "-preset" << preset
+        << "-b:v" << QString::number(vk) + "k" << "-maxrate"
         << QString::number(static_cast<int>(std::ceil(vk * 1.2))) + "k"
-        << "-bufsize" << QString::number(qMax(vk * 2, 300)) + "k" << "-c:a"
-        << "aac" << "-b:a" << QString::number(ak) + "k" << "-movflags"
-        << "+faststart" << outputPath_;
+        << "-bufsize" << QString::number(qMax(vk * 2, 300)) + "k";
+    if (includeAudio)
+      cmd << "-map" << "0:a?" << "-c:a" << "aac" << "-b:a"
+          << QString::number(ak) + "k";
+    else
+      cmd << "-an";
+    cmd << "-movflags" << "+faststart" << outputPath_;
     return cmd;
   }
 
@@ -550,6 +738,7 @@ private:
     QStringList cut{"-y", "-ss", "00:" + req_.startMmss, "-i", req_.path};
     if (req_.durationSeconds > 0)
       cut << "-t" << QString::number(req_.durationSeconds);
+    appendSelectedAudioMaps(cut, req_.selectedAudioStreamIndices);
     cut << "-c" << "copy" << outputPath_;
     if (runStep(cut, 0, 1, targetDuration) != 0) {
       emit failed("Error while cutting");
@@ -576,6 +765,7 @@ private:
     QStringList cut{"-y", "-ss", "00:" + req_.startMmss, "-i", req_.path};
     if (req_.durationSeconds > 0)
       cut << "-t" << QString::number(req_.durationSeconds);
+    appendSelectedAudioMaps(cut, req_.selectedAudioStreamIndices);
     cut << "-c" << "copy" << cutPath;
 
     emit status("Step 1/2  Cutting segment");
@@ -600,7 +790,8 @@ private:
             .arg(req_.presetAudioKbps));
     if (runStep(buildSinglePassCmd(cutPath, req_.presetVideoKbps,
                                    req_.presetAudioKbps,
-                                   req_.presetFfmpegPreset, scale),
+                                   req_.presetFfmpegPreset, scale,
+                                   !req_.selectedAudioStreamIndices.isEmpty()),
                 1, 2, targetDuration) != 0) {
       emit failed("Error during preset compression");
       return;
@@ -627,6 +818,7 @@ private:
     QStringList cut{"-y", "-ss", "00:" + req_.startMmss, "-i", req_.path};
     if (req_.durationSeconds > 0)
       cut << "-t" << QString::number(req_.durationSeconds);
+    appendSelectedAudioMaps(cut, req_.selectedAudioStreamIndices);
     cut << "-c" << "copy" << cutPath;
 
     emit status("Step 1/2  Cutting segment");
@@ -664,13 +856,14 @@ private:
                       .arg(audioKbps));
       int base = 1 + a * 2;
       if (runStep(buildPassCmd(cutPath, videoKbps, audioKbps, "slow", 1,
-                               passlog, scale),
+                               passlog, scale, false),
                   base, totalSteps, targetDuration) != 0) {
         emit failed("ffmpeg error during pass 1");
         return;
       }
       if (runStep(buildPassCmd(cutPath, videoKbps, audioKbps, "slow", 2,
-                               passlog, scale),
+                               passlog, scale,
+                               !req_.selectedAudioStreamIndices.isEmpty()),
                   base + 1, totalSteps, targetDuration) != 0) {
         emit failed("ffmpeg error during pass 2");
         return;
@@ -708,11 +901,14 @@ class MainWindow : public QMainWindow {
   Q_OBJECT
 public:
   MainWindow() : settings_("VideoCutCompress", "VideoCutCompress", this) {
+    setAcceptDrops(true);
     setupUi();
     setupPlayer();
     loadUiSettings();
     updateModeUi();
     updateUiState();
+    // Intercept drag events from all child widgets
+    qApp->installEventFilter(this);
   }
   ~MainWindow() override { cleanupPreviewTemp(); }
 
@@ -725,6 +921,49 @@ protected:
   void closeEvent(QCloseEvent *event) override {
     cleanupPreviewTemp();
     QMainWindow::closeEvent(event);
+  }
+  bool eventFilter(QObject *obj, QEvent *event) override {
+    // Forward drag/drop from any child widget to this window
+    if (obj != this && isAncestorOf(qobject_cast<QWidget *>(obj))) {
+      if (event->type() == QEvent::DragEnter) {
+        auto *de = static_cast<QDragEnterEvent *>(event);
+        if (de->mimeData()->hasUrls()) {
+          const auto urls = de->mimeData()->urls();
+          if (!urls.isEmpty() && urls.first().isLocalFile()) {
+            de->acceptProposedAction();
+            return true;
+          }
+        }
+      } else if (event->type() == QEvent::Drop) {
+        auto *de = static_cast<QDropEvent *>(event);
+        const auto urls = de->mimeData()->urls();
+        if (!urls.isEmpty()) {
+          const QString path =
+              QDir::toNativeSeparators(urls.first().toLocalFile());
+          if (!path.isEmpty()) {
+            loadVideoFile(path);
+            de->acceptProposedAction();
+            return true;
+          }
+        }
+      }
+    }
+    return QMainWindow::eventFilter(obj, event);
+  }
+  void dragEnterEvent(QDragEnterEvent *event) override {
+    if (event->mimeData()->hasUrls()) {
+      const auto urls = event->mimeData()->urls();
+      if (!urls.isEmpty() && urls.first().isLocalFile())
+        event->acceptProposedAction();
+    }
+  }
+  void dropEvent(QDropEvent *event) override {
+    const auto urls = event->mimeData()->urls();
+    if (urls.isEmpty())
+      return;
+    const QString path = QDir::toNativeSeparators(urls.first().toLocalFile());
+    if (!path.isEmpty())
+      loadVideoFile(path);
   }
 
 private:
@@ -774,8 +1013,14 @@ private:
     // inactivity
     mediaInfoTimer_ = new QTimer(this);
     mediaInfoTimer_->setSingleShot(true);
-    connect(mediaInfoTimer_, &QTimer::timeout, this,
-            &MainWindow::refreshMediaLabel);
+    connect(mediaInfoTimer_, &QTimer::timeout, this, [this]() {
+      refreshMediaLabel();
+      refreshAudioTrackList();
+    });
+    previewRefreshTimer_ = new QTimer(this);
+    previewRefreshTimer_->setSingleShot(true);
+    connect(previewRefreshTimer_, &QTimer::timeout, this,
+            [this]() { rebuildPreviewFromCurrentSettings(); });
     connect(videoPathEdit_, &QLineEdit::textChanged, this, [this]() {
       updateButtonStates();
       mediaInfoTimer_->start(600);
@@ -787,6 +1032,34 @@ private:
 
     srcGrpLayout->addWidget(makeLabel("File path:"));
     srcGrpLayout->addLayout(fileRow);
+
+    audioTrackList_ = new QListWidget(this);
+    audioTrackList_->setSelectionMode(QAbstractItemView::NoSelection);
+    audioTrackList_->setMinimumHeight(108);
+    audioTrackList_->setMaximumHeight(140);
+    audioTrackList_->setStyleSheet(
+        "QListWidget { background-color: #0f141a; border: 1px solid #344353; "
+        "border-radius: 6px; padding: 4px; }"
+        "QListWidget::item { padding: 3px 4px; }");
+
+    auto *audioButtonsRow = new QHBoxLayout();
+    audioButtonsRow->setContentsMargins(0, 0, 0, 0);
+    audioButtonsRow->setSpacing(8);
+    selectAllAudioButton_ = new QPushButton("Select all", this);
+    deselectAllAudioButton_ = new QPushButton("Select none", this);
+    connect(selectAllAudioButton_, &QPushButton::clicked, this,
+            [this]() { setAllAudioTracksChecked(Qt::Checked); });
+    connect(deselectAllAudioButton_, &QPushButton::clicked, this,
+            [this]() { setAllAudioTracksChecked(Qt::Unchecked); });
+    audioButtonsRow->addWidget(selectAllAudioButton_);
+    audioButtonsRow->addWidget(deselectAllAudioButton_);
+    audioButtonsRow->addStretch(1);
+
+    srcGrpLayout->addWidget(makeLabel("Audio tracks to keep:"));
+    srcGrpLayout->addWidget(audioTrackList_);
+    srcGrpLayout->addLayout(audioButtonsRow);
+    connect(audioTrackList_, &QListWidget::itemChanged, this,
+            [this](QListWidgetItem *) { handleAudioSelectionChanged(); });
     leftLayout->addWidget(srcGroup);
 
     // --- 2. Target Settings ---
@@ -889,7 +1162,8 @@ private:
     auto *previewBadgeLayout = new QHBoxLayout(previewBadgeWrap_);
     previewBadgeLayout->setContentsMargins(14, 8, 10, 8);
     previewBadgeLayout->setSpacing(8);
-    previewIndicatorLabel_ = new QLabel("Preview Mode Active", previewBadgeWrap_);
+    previewIndicatorLabel_ =
+        new QLabel("Preview Mode Active", previewBadgeWrap_);
     previewBadgeCloseButton_ = new QPushButton("×", previewBadgeWrap_);
     previewBadgeCloseButton_->setObjectName("previewBadgeClose");
     previewBadgeCloseButton_->setCursor(Qt::PointingHandCursor);
@@ -980,7 +1254,7 @@ private:
     vPopLayout->setSpacing(8);
 
     volumeSliderPopup_ = new QSlider(Qt::Vertical, volumePopup_);
-    volumeSliderPopup_->setRange(0, 100);
+    volumeSliderPopup_->setRange(0, 200);
     volumeSliderPopup_->setValue(100);
     volumeSliderPopup_->setMinimumHeight(100);
     volumeLabelPopup_ = new QLabel("100%", volumePopup_);
@@ -1004,12 +1278,11 @@ private:
 
     // old pbRow widget was here
     connect(volumeSliderPopup_, &QSlider::valueChanged, this, [this](int v) {
-      if (audioOutput_)
-        audioOutput_->setVolume(v / 100.0f);
+      globalVolume_ = sliderToGain(v);
+      syncPreviewAudioSelection();
       volumeLabelPopup_->setText(QString("%1%").arg(v));
-      if (volumeButton_) {
+      if (volumeButton_)
         volumeButton_->setIcon(v == 0 ? mutedIcon_ : volumeIcon_);
-      }
     });
 
     // Spaced earlier
@@ -1128,16 +1401,32 @@ private:
   }
 
   void setupPlayer() {
-    audioOutput_ = new QAudioOutput(this);
+    mainGainSink_ = new GainAudioSink(this);
     player_ = new QMediaPlayer(this);
-    player_->setAudioOutput(audioOutput_);
+    mainGainSink_->attachTo(player_);
+    auto *dummyAudioOutput = new QAudioOutput(this);
+    dummyAudioOutput->setVolume(0.0f);
+    player_->setAudioOutput(dummyAudioOutput);
     player_->setVideoOutput(videoWidget_);
     connect(player_, &QMediaPlayer::positionChanged, this,
             &MainWindow::onPositionChanged);
+    connect(player_, &QMediaPlayer::positionChanged, this,
+            [this](qint64 pos) { syncAuxPosition(pos); });
     connect(player_, &QMediaPlayer::durationChanged, this,
             &MainWindow::onDurationChanged);
     connect(player_, &QMediaPlayer::playbackStateChanged, this,
             &MainWindow::onPlaybackStateChanged);
+    connect(player_, &QMediaPlayer::playbackStateChanged, this,
+            [this](QMediaPlayer::PlaybackState) { syncAuxPlaybackState(); });
+    connect(player_, &QMediaPlayer::tracksChanged, this,
+            [this]() { syncPreviewAudioSelection(); });
+    connect(player_, &QMediaPlayer::mediaStatusChanged, this,
+            [this](QMediaPlayer::MediaStatus status) {
+              if (status == QMediaPlayer::LoadedMedia ||
+                  status == QMediaPlayer::BufferedMedia) {
+                syncPreviewAudioSelection();
+              }
+            });
   }
 
   void applyIcons() {
@@ -1300,7 +1589,7 @@ private:
     previewModeEnabled_ = settings_.value("ui/preview_mode", false).toBool();
 
     maxSizeEdit_->setText(maxSize);
-    volumeSliderPopup_->setValue(qBound(0, volume, 100));
+    volumeSliderPopup_->setValue(qBound(0, volume, 200));
 
     const int modeIndex = modeCombo_->findData(mode);
     if (modeIndex >= 0)
@@ -1319,7 +1608,9 @@ private:
     updatePreviewButtonText();
   }
 
-  qint64 effectivePreviewStart() const { return previewModeEnabled_ ? previewStartMs_ : 0; }
+  qint64 effectivePreviewStart() const {
+    return previewModeEnabled_ ? previewStartMs_ : 0;
+  }
 
   qint64 effectivePreviewEnd() const {
     if (!player_)
@@ -1342,7 +1633,7 @@ private:
     if (!previewModeEnabled_)
       return absPos;
     return qBound<qint64>(0, absPos - effectivePreviewStart(),
-                         effectiveTimelineDuration());
+                          effectiveTimelineDuration());
   }
 
   qint64 absolutePositionFromDisplay(qint64 displayPos) const {
@@ -1355,8 +1646,9 @@ private:
   void refreshPlaybackTimeline() {
     if (!positionSlider_ || !player_)
       return;
-    const qint64 duration = previewModeEnabled_ ? effectiveTimelineDuration()
-                                                : qMax<qint64>(player_->duration(), 0);
+    const qint64 duration = previewModeEnabled_
+                                ? effectiveTimelineDuration()
+                                : qMax<qint64>(player_->duration(), 0);
     positionSlider_->setRange(0, static_cast<int>(duration));
     const qint64 displayPos = displayPositionFromAbsolute(player_->position());
     if (!sliderDragging_)
@@ -1389,6 +1681,318 @@ private:
     cachedMediaInfo_ = getMediaInfo(path);
     return cachedMediaInfo_;
   }
+
+  QVector<AudioTrackInfo> probeAudioTracks(const QString &path) {
+    if (path == cachedAudioPath_)
+      return cachedAudioTracks_;
+    cachedAudioPath_ = path;
+    cachedAudioTracks_ = getAudioTracks(path);
+    return cachedAudioTracks_;
+  }
+
+  QVector<int> checkedAudioStreamIndices() const {
+    QVector<int> streamIndices;
+    if (!audioTrackList_)
+      return streamIndices;
+    for (int i = 0; i < audioTrackList_->count(); ++i) {
+      auto *item = audioTrackList_->item(i);
+      if (!item)
+        continue;
+      auto *w = audioTrackList_->itemWidget(item);
+      auto *cb = w ? w->findChild<QCheckBox *>("trackCb") : nullptr;
+      if (cb && cb->isChecked())
+        streamIndices.push_back(item->data(Qt::UserRole).toInt());
+    }
+    return streamIndices;
+  }
+
+  float getTrackVolumeAtIndex(int listIndex) const {
+    if (!audioTrackList_ || listIndex < 0 ||
+        listIndex >= audioTrackList_->count())
+      return 1.0f;
+    auto *item = audioTrackList_->item(listIndex);
+    if (!item)
+      return 1.0f;
+    auto *w = audioTrackList_->itemWidget(item);
+    auto *sl = w ? w->findChild<QSlider *>("trackVol") : nullptr;
+    return sl ? sliderToGain(sl->value()) : 1.0f;
+  }
+
+  int audioTrackListIndexForStreamIndex(int streamIndex) const {
+    for (int i = 0; i < cachedAudioTracks_.size(); ++i) {
+      if (cachedAudioTracks_.at(i).streamIndex == streamIndex)
+        return i;
+    }
+    return -1;
+  }
+
+  bool previewNeedsGeneratedMedia(const Request &req) const {
+    return req.selectedAudioStreamIndices.size() > 1;
+  }
+
+  void setAllAudioTracksChecked(Qt::CheckState state) {
+    if (!audioTrackList_)
+      return;
+    for (int i = 0; i < audioTrackList_->count(); ++i) {
+      auto *item = audioTrackList_->item(i);
+      if (!item)
+        continue;
+      auto *w = audioTrackList_->itemWidget(item);
+      auto *cb = w ? w->findChild<QCheckBox *>("trackCb") : nullptr;
+      if (cb) {
+        QSignalBlocker blocker(cb);
+        cb->setCheckState(state);
+      }
+    }
+    handleAudioSelectionChanged();
+  }
+
+  void refreshAudioTrackList() {
+    if (!audioTrackList_)
+      return;
+    const QString path = videoPathEdit_->text().trimmed();
+    if (path.isEmpty() || !QFileInfo::exists(path)) {
+      audioTrackList_->clear();
+      audioTrackList_->setEnabled(false);
+      selectAllAudioButton_->setEnabled(false);
+      deselectAllAudioButton_->setEnabled(false);
+      return;
+    }
+
+    QSet<int> checkedTracks;
+    QMap<int, int> savedVolumes; // streamIndex -> volume 0-100
+    bool hadWidgetItems = false;
+    for (int i = 0; i < audioTrackList_->count(); ++i) {
+      auto *item = audioTrackList_->item(i);
+      if (!item)
+        continue;
+      auto *w = audioTrackList_->itemWidget(item);
+      if (!w)
+        continue;
+      hadWidgetItems = true;
+      const int streamIdx = item->data(Qt::UserRole).toInt();
+      auto *cb = w->findChild<QCheckBox *>("trackCb");
+      if (cb && cb->isChecked())
+        checkedTracks.insert(streamIdx);
+      auto *sl = w->findChild<QSlider *>("trackVol");
+      if (sl)
+        savedVolumes[streamIdx] = sl->value();
+    }
+
+    const auto tracks = probeAudioTracks(path);
+    audioTrackList_->clear();
+    if (tracks.isEmpty()) {
+      auto *item = new QListWidgetItem("No audio track detected");
+      item->setFlags(Qt::NoItemFlags);
+      audioTrackList_->addItem(item);
+      audioTrackList_->setEnabled(false);
+      selectAllAudioButton_->setEnabled(false);
+      deselectAllAudioButton_->setEnabled(false);
+      return;
+    }
+
+    for (const auto &track : tracks) {
+      auto *item = new QListWidgetItem(audioTrackList_);
+      item->setData(Qt::UserRole, track.streamIndex);
+      item->setFlags(item->flags() & ~Qt::ItemIsUserCheckable);
+      item->setSizeHint(QSize(-1, 30));
+
+      auto *row = new QWidget();
+      row->setStyleSheet("background: transparent;");
+      auto *hLayout = new QHBoxLayout(row);
+      hLayout->setContentsMargins(4, 1, 8, 1);
+      hLayout->setSpacing(8);
+
+      auto *cb = new QCheckBox(track.label, row);
+      cb->setObjectName("trackCb");
+      cb->setChecked(!hadWidgetItems ||
+                     checkedTracks.contains(track.streamIndex));
+      cb->setStyleSheet("color: #d0dce8;");
+
+      const int initVol = savedVolumes.value(track.streamIndex, 100);
+      auto *volSlider = new QSlider(Qt::Horizontal, row);
+      volSlider->setObjectName("trackVol");
+      volSlider->setRange(0, 200);
+      volSlider->setValue(initVol);
+      volSlider->setFixedWidth(70);
+      volSlider->setToolTip("Track volume");
+
+      auto *volLabel = new QLabel(QString("%1%").arg(initVol), row);
+      volLabel->setObjectName("trackVolLabel");
+      volLabel->setFixedWidth(36);
+      volLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+      volLabel->setStyleSheet("color: #8899aa; font-size: 10px;");
+
+      hLayout->addWidget(cb, 1);
+      hLayout->addWidget(volSlider);
+      hLayout->addWidget(volLabel);
+
+      connect(cb, &QCheckBox::checkStateChanged, this,
+              [this]() { handleAudioSelectionChanged(); });
+      connect(volSlider, &QSlider::valueChanged, this, [this, volLabel](int v) {
+        volLabel->setText(QString("%1%").arg(v));
+        syncPreviewAudioSelection();
+      });
+
+      audioTrackList_->setItemWidget(item, row);
+    }
+    audioTrackList_->setEnabled(true);
+    selectAllAudioButton_->setEnabled(true);
+    deselectAllAudioButton_->setEnabled(true);
+    setupAuxPlayersForSource(path);
+    syncPreviewAudioSelection();
+  }
+
+  void syncPreviewAudioSelection() {
+    if (!player_)
+      return;
+
+    const auto selectedStreams = checkedAudioStreamIndices();
+    QSet<int> selectedSet(selectedStreams.begin(), selectedStreams.end());
+
+    if (cachedAudioTracks_.isEmpty() || selectedStreams.isEmpty()) {
+      if (mainGainSink_)
+        mainGainSink_->setMuted(true);
+      for (auto *s : auxGainSinks_)
+        s->setMuted(true);
+      return;
+    }
+
+    // Main player always handles audio track index 0 (first in file)
+    const int firstStreamIdx = cachedAudioTracks_.first().streamIndex;
+    if (mainGainSink_) {
+      mainGainSink_->setMuted(!selectedSet.contains(firstStreamIdx));
+      mainGainSink_->setVolume(globalVolume_ * getTrackVolumeAtIndex(0));
+    }
+    if (player_->activeAudioTrack() != 0)
+      player_->setActiveAudioTrack(0);
+
+    // Aux players handle tracks 1..N-1. Mute/unmute + per-track volume.
+    for (int i = 0; i < auxAudioPlayers_.size(); ++i) {
+      const int trackIdx = i + 1;
+      if (trackIdx >= cachedAudioTracks_.size())
+        break;
+      const int streamIdx = cachedAudioTracks_.at(trackIdx).streamIndex;
+      auxGainSinks_.at(i)->setMuted(!selectedSet.contains(streamIdx));
+      auxGainSinks_.at(i)->setVolume(globalVolume_ *
+                                     getTrackVolumeAtIndex(trackIdx));
+    }
+  }
+
+  void setupAuxPlayersForSource(const QString &sourcePath) {
+    destroyAuxAudioPlayers();
+    if (cachedAudioTracks_.size() <= 1 || sourcePath.isEmpty())
+      return;
+
+    for (int i = 1; i < cachedAudioTracks_.size(); ++i) {
+      auto *gainSink = new GainAudioSink(this);
+      gainSink->setVolume(mainGainSink_ ? mainGainSink_->volume() : 1.0f);
+      gainSink->setMuted(true);
+
+      auto *p = new QMediaPlayer(this);
+      gainSink->attachTo(p);
+      auto *dummyAudioOutput = new QAudioOutput(p);
+      dummyAudioOutput->setVolume(0.0f);
+      p->setAudioOutput(dummyAudioOutput);
+      p->setSource(QUrl::fromLocalFile(sourcePath));
+
+      const int trackIndex = i;
+      connect(p, &QMediaPlayer::mediaStatusChanged, this,
+              [p, trackIndex](QMediaPlayer::MediaStatus st) {
+                if (st == QMediaPlayer::LoadedMedia ||
+                    st == QMediaPlayer::BufferedMedia) {
+                  if (p->activeAudioTrack() != trackIndex)
+                    p->setActiveAudioTrack(trackIndex);
+                }
+              });
+
+      auxAudioPlayers_.push_back(p);
+      auxGainSinks_.push_back(gainSink);
+    }
+  }
+
+  void destroyAuxAudioPlayers() {
+    for (auto *p : auxAudioPlayers_) {
+      p->stop();
+      p->deleteLater();
+    }
+    auxAudioPlayers_.clear();
+    for (auto *s : auxGainSinks_)
+      s->deleteLater();
+    auxGainSinks_.clear();
+  }
+
+  void syncAuxPlaybackState() {
+    if (!player_)
+      return;
+    const auto state = player_->playbackState();
+    const qint64 pos = player_->position();
+    for (auto *p : auxAudioPlayers_) {
+      if (state == QMediaPlayer::PlayingState) {
+        if (std::llabs(p->position() - pos) > 200)
+          p->setPosition(pos);
+        if (p->playbackState() != QMediaPlayer::PlayingState)
+          p->play();
+      } else if (state == QMediaPlayer::PausedState) {
+        p->pause();
+        p->setPosition(pos);
+      } else {
+        p->stop();
+      }
+    }
+  }
+
+  void syncAuxPosition(qint64 pos) {
+    for (auto *p : auxAudioPlayers_) {
+      if (std::llabs(p->position() - pos) > 200)
+        p->setPosition(pos);
+    }
+  }
+
+  void syncAuxVolume(float vol) {
+    globalVolume_ = vol;
+    syncPreviewAudioSelection();
+  }
+
+  void restoreDefaultAudioSelection() { syncPreviewAudioSelection(); }
+
+  void startVirtualPreview(const Request &req) {
+    previewModeEnabled_ = true;
+    previewStartMs_ = static_cast<qint64>(mmssToSeconds(req.startMmss)) * 1000;
+    previewEndMs_ =
+        req.endMmss.isEmpty()
+            ? static_cast<qint64>(std::llround(req.mediaInfo.duration * 1000.0))
+            : static_cast<qint64>(mmssToSeconds(req.endMmss)) * 1000;
+    if (player_->source() != QUrl::fromLocalFile(req.path))
+      player_->setSource(QUrl::fromLocalFile(req.path));
+    syncPreviewAudioSelection();
+    setPlayerControlsEnabled(true);
+    setProgressVisible(false);
+    requestSeek(0);
+    refreshPlaybackTimeline();
+
+    if (req.selectedAudioStreamIndices.isEmpty())
+      setStatus(
+          "Preview mode enabled. Timeline is limited to the selected segment.");
+    else
+      setStatus("Preview mode enabled.");
+    saveUiSettings();
+  }
+
+  void rebuildPreviewFromCurrentSettings() {
+    if (!previewModeEnabled_)
+      return;
+
+    auto [req, err] = buildRequest(false);
+    if (!err.isEmpty()) {
+      setStatus(err);
+      return;
+    }
+
+    startVirtualPreview(req);
+  }
+
+  void handleAudioSelectionChanged() { syncPreviewAudioSelection(); }
 
   void updateButtonStates() {
     QString path = videoPathEdit_->text().trimmed();
@@ -1429,6 +2033,7 @@ private:
   void updateUiState() {
     updateButtonStates();
     refreshMediaLabel();
+    refreshAudioTrackList();
   }
 
   std::pair<Request, QString> buildRequest(bool requireSize) {
@@ -1445,6 +2050,14 @@ private:
     req.mediaInfo = probeMediaInfo(req.path);
     if (!req.mediaInfo.ok)
       return {req, "Unable to read video information"};
+    for (int i = 0; i < audioTrackList_->count(); ++i) {
+      auto *item = audioTrackList_->item(i);
+      if (!item || !(item->flags() & Qt::ItemIsUserCheckable))
+        continue;
+      if (item->checkState() == Qt::Checked)
+        req.selectedAudioStreamIndices.push_back(
+            item->data(Qt::UserRole).toInt());
+    }
 
     QString startRaw = startEdit_->text().trimmed();
     QString endRaw = endEdit_->text().trimmed();
@@ -1486,18 +2099,15 @@ private:
     return {req, {}};
   }
 
-  void selectVideo() {
-    QString path = QFileDialog::getOpenFileName(
-        this, "Choose a video",
-        settings_.value("last_video_dir", "").toString(),
-        "Videos (*.mp4 *.mov *.mkv *.avi *.asf)");
-    if (path.isEmpty())
-      return;
+  void loadVideoFile(const QString &path) {
+    if (previewRefreshTimer_)
+      previewRefreshTimer_->stop();
     videoPathEdit_->setText(path);
     settings_.setValue("last_video_dir", QFileInfo(path).absolutePath());
     cleanupPreviewTemp();
     previewStartMs_ = 0;
     previewEndMs_ = -1;
+    autoEnteredPreviewMode_ = false;
     player_->setSource(QUrl::fromLocalFile(path));
     player_->setPosition(0);
     pendingSeekPosition_ = 0;
@@ -1506,6 +2116,19 @@ private:
     setStatus("Video loaded. Source preview is ready. Use playback controls.");
     progressBar_->setValue(0);
     setProgressVisible(false);
+    refreshAudioTrackList();
+  }
+
+  void selectVideo() {
+    if (previewRefreshTimer_)
+      previewRefreshTimer_->stop();
+    QString path = QFileDialog::getOpenFileName(
+        this, "Choose a video",
+        settings_.value("last_video_dir", "").toString(),
+        "Videos (*.mp4 *.mov *.mkv *.avi *.asf)");
+    if (path.isEmpty())
+      return;
+    loadVideoFile(path);
   }
 
   void startPreview() {
@@ -1516,11 +2139,16 @@ private:
     }
 
     if (previewModeEnabled_) {
+      if (previewRefreshTimer_)
+        previewRefreshTimer_->stop();
       previewModeEnabled_ = false;
       previewStartMs_ = 0;
       previewEndMs_ = -1;
       pendingSeekPosition_.reset();
       pendingSeekDirection_ = 0;
+      if (player_->source() != QUrl::fromLocalFile(src))
+        player_->setSource(QUrl::fromLocalFile(src));
+      restoreDefaultAudioSelection();
       refreshPlaybackTimeline();
       setStatus("Preview mode disabled.");
       saveUiSettings();
@@ -1530,40 +2158,9 @@ private:
     auto [req, err] = buildRequest(false);
     if (!err.isEmpty()) {
       setStatus(err);
-      setProgressVisible(false);
       return;
     }
-    previewModeEnabled_ = true;
-    previewStartMs_ = static_cast<qint64>(mmssToSeconds(req.startMmss)) * 1000;
-    previewEndMs_ = req.endMmss.isEmpty()
-                        ? static_cast<qint64>(std::llround(req.mediaInfo.duration * 1000.0))
-                        : static_cast<qint64>(mmssToSeconds(req.endMmss)) * 1000;
-    if (player_->source() != QUrl::fromLocalFile(req.path))
-      player_->setSource(QUrl::fromLocalFile(req.path));
-    setPlayerControlsEnabled(true);
-    setProgressVisible(false);
-    requestSeek(0);
-    refreshPlaybackTimeline();
-    setStatus("Preview mode enabled. Timeline is limited to the selected segment.");
-    saveUiSettings();
-  }
-
-  void onPreviewReady(const QString &tempDir, const QString &cutPath) {
-    previewTempDir_ = tempDir;
-    player_->setSource(QUrl::fromLocalFile(cutPath));
-    player_->setPosition(0);
-    pendingSeekPosition_ = 0;
-    pendingSeekDirection_ = 0;
-    setPlayerControlsEnabled(true);
-    setProgressVisible(false);
-    setStatus("Segment loaded. Use Play/Pause and the timeline.");
-  }
-
-  void onPreviewFailed(const QString &msg) {
-    progressBar_->setValue(0);
-    setProgressVisible(false);
-    setStatus(msg);
-    setPlayerControlsEnabled(false);
+    startVirtualPreview(req);
   }
 
   void startCutAndCompress() {
@@ -1634,8 +2231,7 @@ private:
 
     const qint64 endPos =
         previewModeEnabled_ ? effectivePreviewEnd() : player_->duration();
-    const qint64 restartPos =
-        previewModeEnabled_ ? effectivePreviewStart() : 0;
+    const qint64 restartPos = previewModeEnabled_ ? effectivePreviewStart() : 0;
     if (player_->position() >= qMax<qint64>(0, endPos - 80))
       player_->setPosition(restartPos);
     player_->play();
@@ -1695,8 +2291,9 @@ private:
     const qint64 displayPos = displayPositionFromAbsolute(p);
     if (!sliderDragging_)
       positionSlider_->setValue(static_cast<int>(displayPos));
-    updateTimeLabel(displayPos, previewModeEnabled_ ? effectiveTimelineDuration()
-                                                    : player_->duration());
+    updateTimeLabel(displayPos, previewModeEnabled_
+                                    ? effectiveTimelineDuration()
+                                    : player_->duration());
   }
 
   void onSliderPressed() { sliderDragging_ = true; }
@@ -1760,10 +2357,13 @@ private:
     if (previewModeEnabled_) {
       auto [req, err] = buildRequest(false);
       if (err.isEmpty()) {
-        previewStartMs_ = static_cast<qint64>(mmssToSeconds(req.startMmss)) * 1000;
-        previewEndMs_ = req.endMmss.isEmpty()
-                            ? static_cast<qint64>(std::llround(req.mediaInfo.duration * 1000.0))
-                            : static_cast<qint64>(mmssToSeconds(req.endMmss)) * 1000;
+        previewStartMs_ =
+            static_cast<qint64>(mmssToSeconds(req.startMmss)) * 1000;
+        previewEndMs_ =
+            req.endMmss.isEmpty()
+                ? static_cast<qint64>(
+                      std::llround(req.mediaInfo.duration * 1000.0))
+                : static_cast<qint64>(mmssToSeconds(req.endMmss)) * 1000;
         const qint64 absPos = player_ ? player_->position() : 0;
         if (absPos < effectivePreviewStart() || absPos > effectivePreviewEnd())
           requestSeek(0);
@@ -1815,8 +2415,9 @@ private:
       return;
 #ifdef Q_OS_WIN
     if (QFileInfo::exists(lastOutputPath_)) {
-      QProcess::startDetached("explorer.exe",
-                              {"/select,", QDir::toNativeSeparators(lastOutputPath_)});
+      QProcess::startDetached(
+          "explorer.exe",
+          {"/select,", QDir::toNativeSeparators(lastOutputPath_)});
       return;
     }
 #endif
@@ -1826,10 +2427,16 @@ private:
   }
 
   void cleanupPreviewTemp() {
+    if (previewRefreshTimer_)
+      previewRefreshTimer_->stop();
     if (player_)
       player_->stop();
+    destroyAuxAudioPlayers();
     const bool hadPreviewMode = previewModeEnabled_;
     previewModeEnabled_ = false;
+    autoEnteredPreviewMode_ = false;
+    pendingPreviewAutoPlay_ = false;
+    pendingPreviewDisplayPos_ = 0;
     previewStartMs_ = 0;
     previewEndMs_ = -1;
     pendingSeekPosition_.reset();
@@ -1841,9 +2448,6 @@ private:
     }
     if (timeLabel_)
       timeLabel_->setText("00:00 / 00:00");
-    if (!previewTempDir_.isEmpty())
-      rmDir(previewTempDir_);
-    previewTempDir_.clear();
     if (playPauseButton_)
       setPlayerControlsEnabled(false);
     updatePreviewButtonText();
@@ -1853,31 +2457,41 @@ private:
   }
 
   QSettings settings_;
-  QString previewTempDir_;
   QString cachedMediaPath_;
+  QString cachedAudioPath_;
   QString pendingOutputPath_;
   QString lastOutputPath_;
   MediaInfo cachedMediaInfo_;
+  QVector<AudioTrackInfo> cachedAudioTracks_;
   QTimer *mediaInfoTimer_ = nullptr;
-  PreviewWorker *previewWorker_ = nullptr;
+  QTimer *previewRefreshTimer_ = nullptr;
   CompressionWorker *compressionWorker_ = nullptr;
+  GainAudioSink *mainGainSink_ = nullptr;
+  QVector<QMediaPlayer *> auxAudioPlayers_;
+  QVector<GainAudioSink *> auxGainSinks_;
   bool sliderDragging_ = false;
+  float globalVolume_ = 1.0f;
   bool previewModeEnabled_ = false;
+  bool autoEnteredPreviewMode_ = false;
+  bool pendingPreviewAutoPlay_ = false;
   std::optional<qint64> pendingSeekPosition_;
   int pendingSeekDirection_ = 0;
   qint64 lastSeekRetryMs_ = 0;
   qint64 previewStartMs_ = 0;
   qint64 previewEndMs_ = -1;
+  qint64 pendingPreviewDisplayPos_ = 0;
 
   QLineEdit *videoPathEdit_, *startEdit_, *endEdit_, *maxSizeEdit_,
       *presetVideoKbpsEdit_, *presetAudioKbpsEdit_, *presetWidthLimitEdit_;
   QComboBox *modeCombo_, *presetCombo_, *presetFfmpegCombo_;
+  QListWidget *audioTrackList_ = nullptr;
   QLabel *maxSizeLabel_, *infoLabel_, *timeLabel_, *statusLabel_;
   QLabel *previewIndicatorLabel_ = nullptr;
   QFrame *previewBadgeWrap_ = nullptr;
   QPushButton *markStartButton_, *markEndButton_, *runButton_, *previewButton_,
       *backButton_, *playPauseButton_, *stopButton_, *forwardButton_,
-      *openOutputButton_ = nullptr, *previewBadgeCloseButton_ = nullptr;
+      *openOutputButton_ = nullptr, *previewBadgeCloseButton_ = nullptr,
+      *selectAllAudioButton_ = nullptr, *deselectAllAudioButton_ = nullptr;
   QWidget *modeSectionWrap_ = nullptr, *sizeRowWrap_ = nullptr,
           *presetWrap_ = nullptr;
   QVideoWidget *videoWidget_ = nullptr;
@@ -1888,7 +2502,7 @@ private:
   QLabel *volumeLabelPopup_ = nullptr;
   QProgressBar *progressBar_;
   QIcon playIcon_, pauseIcon_, volumeIcon_, mutedIcon_;
-  QAudioOutput *audioOutput_ = nullptr;
+
   QMediaPlayer *player_ = nullptr;
 };
 
