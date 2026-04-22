@@ -308,6 +308,7 @@ struct Request {
   int presetWidthLimit = 0;
   QString presetFfmpegPreset = "medium";
   QVector<int> selectedAudioStreamIndices;
+  QVector<float> selectedAudioGains;
 };
 
 QString padTime(const QString &value) {
@@ -654,12 +655,79 @@ protected:
   }
 
 private:
+  static QString audioGainArg(float gain) {
+    return QString::number(static_cast<double>(gain), 'f', 6);
+  }
+
+  bool hasSelectedAudio() const {
+    return !req_.selectedAudioStreamIndices.isEmpty();
+  }
+
+  bool hasAdjustedAudioGains() const {
+    for (float gain : req_.selectedAudioGains) {
+      if (std::abs(gain - 1.0f) > 0.002f)
+        return true;
+    }
+    return false;
+  }
+
+  bool needsRenderedAudioFilter() const {
+    return hasAdjustedAudioGains() || req_.selectedAudioStreamIndices.size() > 1;
+  }
+
+  float selectedAudioGainAt(int index) const {
+    if (index >= 0 && index < req_.selectedAudioGains.size())
+      return req_.selectedAudioGains.at(index);
+    return 1.0f;
+  }
+
+  QString audioInputSpec(int index, bool useOriginalStreamIndices) const {
+    if (useOriginalStreamIndices)
+      return QString("0:%1").arg(req_.selectedAudioStreamIndices.at(index));
+    return QString("0:a:%1").arg(index);
+  }
+
   void appendSelectedAudioMaps(QStringList &cmd,
                                const QVector<int> &streamIndices,
                                const QString &inputPrefix = "0") const {
     cmd << "-map" << inputPrefix + ":v:0?";
     for (int streamIndex : streamIndices)
       cmd << "-map" << QString("%1:%2").arg(inputPrefix).arg(streamIndex);
+  }
+
+  void appendSelectedAudioOutput(QStringList &cmd, int audioKbps,
+                                 bool useOriginalStreamIndices) const {
+    if (!hasSelectedAudio()) {
+      cmd << "-an";
+      return;
+    }
+
+    if (needsRenderedAudioFilter()) {
+      QStringList filters;
+      for (int i = 0; i < req_.selectedAudioStreamIndices.size(); ++i) {
+        filters << QString("[%1]volume=%2[a%3]")
+                       .arg(audioInputSpec(i, useOriginalStreamIndices),
+                            audioGainArg(selectedAudioGainAt(i)))
+                       .arg(i);
+      }
+      if (req_.selectedAudioStreamIndices.size() == 1) {
+        filters << "[a0]anull[aout]";
+      } else {
+        QStringList inputs;
+        for (int i = 0; i < req_.selectedAudioStreamIndices.size(); ++i)
+          inputs << QString("[a%1]").arg(i);
+        filters << QString("%1amix=inputs=%2:duration=longest:normalize=0[aout]")
+                       .arg(inputs.join(""),
+                            QString::number(req_.selectedAudioStreamIndices.size()));
+      }
+      cmd << "-filter_complex" << filters.join(";") << "-map" << "[aout]";
+    } else {
+      cmd << "-map" << audioInputSpec(0, useOriginalStreamIndices);
+    }
+
+    cmd << "-c:a" << "aac";
+    if (audioKbps > 0)
+      cmd << "-b:a" << QString::number(audioKbps) + "k";
   }
 
   QStringList buildPassCmd(const QString &path, int vk, int ak,
@@ -674,15 +742,17 @@ private:
         << QString::number(vk) + "k" << "-maxrate"
         << QString::number(static_cast<int>(std::ceil(vk * 1.15))) + "k"
         << "-bufsize" << QString::number(qMax(vk * 2, 300)) + "k" << "-pass"
-        << QString::number(passNo) << "-passlogfile" << passlog << "-movflags"
-        << "+faststart";
+        << QString::number(passNo) << "-passlogfile" << passlog;
     if (passNo == 1)
       cmd << "-an" << "-f" << "mp4" << "NUL";
     else if (includeAudio)
-      cmd << "-map" << "0:a?" << "-c:a" << "aac" << "-b:a"
-          << QString::number(ak) + "k" << outputPath_;
+      appendSelectedAudioOutput(cmd, ak, false);
     else
-      cmd << "-an" << outputPath_;
+      cmd << "-an";
+    if (passNo != 1) {
+      cmd << "-movflags" << "+faststart";
+      cmd << outputPath_;
+    }
     return cmd;
   }
 
@@ -697,8 +767,7 @@ private:
         << QString::number(static_cast<int>(std::ceil(vk * 1.2))) + "k"
         << "-bufsize" << QString::number(qMax(vk * 2, 300)) + "k";
     if (includeAudio)
-      cmd << "-map" << "0:a?" << "-c:a" << "aac" << "-b:a"
-          << QString::number(ak) + "k";
+      appendSelectedAudioOutput(cmd, ak, false);
     else
       cmd << "-an";
     cmd << "-movflags" << "+faststart" << outputPath_;
@@ -738,8 +807,14 @@ private:
     QStringList cut{"-y", "-ss", "00:" + req_.startMmss, "-i", req_.path};
     if (req_.durationSeconds > 0)
       cut << "-t" << QString::number(req_.durationSeconds);
-    appendSelectedAudioMaps(cut, req_.selectedAudioStreamIndices);
-    cut << "-c" << "copy" << outputPath_;
+    if (needsRenderedAudioFilter()) {
+      cut << "-map" << "0:v:0?" << "-c:v" << "copy";
+      appendSelectedAudioOutput(cut, 192, true);
+      cut << "-movflags" << "+faststart" << outputPath_;
+    } else {
+      appendSelectedAudioMaps(cut, req_.selectedAudioStreamIndices);
+      cut << "-c" << "copy" << outputPath_;
+    }
     if (runStep(cut, 0, 1, targetDuration) != 0) {
       emit failed("Error while cutting");
       return;
@@ -2050,13 +2125,21 @@ private:
     req.mediaInfo = probeMediaInfo(req.path);
     if (!req.mediaInfo.ok)
       return {req, "Unable to read video information"};
-    for (int i = 0; i < audioTrackList_->count(); ++i) {
-      auto *item = audioTrackList_->item(i);
-      if (!item || !(item->flags() & Qt::ItemIsUserCheckable))
-        continue;
-      if (item->checkState() == Qt::Checked)
+    if (audioTrackList_) {
+      for (int i = 0; i < audioTrackList_->count(); ++i) {
+        auto *item = audioTrackList_->item(i);
+        if (!item)
+          continue;
+        auto *w = audioTrackList_->itemWidget(item);
+        auto *cb = w ? w->findChild<QCheckBox *>("trackCb") : nullptr;
+        if (!cb || !cb->isChecked())
+          continue;
         req.selectedAudioStreamIndices.push_back(
             item->data(Qt::UserRole).toInt());
+        auto *sl = w->findChild<QSlider *>("trackVol");
+        req.selectedAudioGains.push_back(sl ? sliderToGain(sl->value())
+                                            : 1.0f);
+      }
     }
 
     QString startRaw = startEdit_->text().trimmed();
