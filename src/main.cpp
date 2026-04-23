@@ -22,6 +22,7 @@
 #include <QtGui/QDesktopServices>
 #include <QtGui/QDragEnterEvent>
 #include <QtGui/QIcon>
+#include <QtGui/QKeyEvent>
 #include <QtGui/QMouseEvent>
 #include <QtGui/QPainter>
 #include <QtGui/QPainterPath>
@@ -34,7 +35,6 @@
 #include <QtMultimedia/QMediaMetaData>
 #include <QtMultimedia/QMediaPlayer>
 #include <QtMultimediaWidgets/QVideoWidget>
-#include <QtWidgets/QAbstractItemView>
 #include <QtWidgets/QApplication>
 #include <QtWidgets/QCheckBox>
 #include <QtWidgets/QComboBox>
@@ -44,12 +44,13 @@
 #include <QtWidgets/QHBoxLayout>
 #include <QtWidgets/QLabel>
 #include <QtWidgets/QLineEdit>
-#include <QtWidgets/QListWidget>
 #include <QtWidgets/QMainWindow>
 #include <QtWidgets/QProgressBar>
 #include <QtWidgets/QPushButton>
+#include <QtWidgets/QScrollArea>
 #include <QtWidgets/QSizePolicy>
 #include <QtWidgets/QSlider>
+#include <QtWidgets/QSpinBox>
 #include <QtWidgets/QStyle>
 #include <QtWidgets/QStyleOptionSlider>
 #include <QtWidgets/QVBoxLayout>
@@ -85,6 +86,28 @@ QLineEdit {
     min-height: 22px;
     max-height: 22px;
 }
+QSpinBox {
+    background-color: #0f141a;
+    color: #e7edf3;
+    border: 1px solid #344353;
+    border-radius: 6px;
+    padding: 0 4px;
+    min-height: 24px;
+}
+QSpinBox::up-button, QSpinBox::down-button {
+    width: 0px;
+    border: none;
+}
+QSpinBox::up-arrow, QSpinBox::down-arrow {
+    image: none;
+}
+QSpinBox QLineEdit {
+    padding: 0 2px;
+    margin: 0;
+    min-height: 24px;
+    background: transparent;
+    border: none;
+}
 QComboBox {
     background-color: #0f141a;
     color: #e7edf3;
@@ -102,19 +125,21 @@ QPushButton { background-color: #1f56c7; color: #fff; border: none; border-radiu
 QPushButton:hover { background-color: #1a4aa9; }
 QPushButton:disabled { background-color: #3a4552; color: #95a3b1; }
 QSlider::groove:horizontal { height: 10px; background: #2b3642; border-radius: 4px; }
+QSlider::sub-page:horizontal { background: #3d8bfd; border-radius: 4px; }
+QSlider::add-page:horizontal { background: #2b3642; border-radius: 4px; }
 QSlider::handle:horizontal { background: #3d8bfd; border: 2px solid #2f6fd0; width: 18px; margin: -6px 0; border-radius: 9px; }
 QProgressBar {
-    background: #18212b;
+    background: #101821;
     border: 1px solid #304050;
     border-radius: 8px;
     color: #eef4fb;
     text-align: center;
     min-height: 18px;
-    padding: 0 6px;
+    padding: 2px;
     font-weight: 600;
 }
 QProgressBar::chunk {
-    border-radius: 7px;
+    border-radius: 5px;
     background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #2f80ed, stop:1 #57a5ff);
 }
 #previewView { background: #0c1015; border: 1px solid #2f3b49; border-radius: 8px; }
@@ -559,12 +584,35 @@ public:
 protected:
   void mousePressEvent(QMouseEvent *e) override {
     if (e->button() == Qt::LeftButton && maximum() > minimum()) {
-      int v = QStyle::sliderValueFromPosition(
-          minimum(), maximum(), e->position().x(), qMax(1, width()));
-      setValue(v);
-      emit sliderMoved(v);
+      dragging_ = true;
+      setSliderDown(true);
+      emit sliderPressed();
+      updateFromMouse(e->position().x());
+      e->accept();
+      return;
     }
     QSlider::mousePressEvent(e);
+  }
+
+  void mouseMoveEvent(QMouseEvent *e) override {
+    if (dragging_ && maximum() > minimum()) {
+      updateFromMouse(e->position().x());
+      e->accept();
+      return;
+    }
+    QSlider::mouseMoveEvent(e);
+  }
+
+  void mouseReleaseEvent(QMouseEvent *e) override {
+    if (dragging_ && e->button() == Qt::LeftButton) {
+      updateFromMouse(e->position().x());
+      dragging_ = false;
+      setSliderDown(false);
+      emit sliderReleased();
+      e->accept();
+      return;
+    }
+    QSlider::mouseReleaseEvent(e);
   }
 
   void paintEvent(QPaintEvent *event) override {
@@ -620,8 +668,18 @@ protected:
   }
 
 private:
+  void updateFromMouse(qreal x) {
+    const int v = QStyle::sliderValueFromPosition(
+        minimum(), maximum(), static_cast<int>(std::round(x)), qMax(1, width()),
+        invertedAppearance());
+    if (v != value())
+      setValue(v);
+    emit sliderMoved(v);
+  }
+
   int startMarkerMs_ = -1;
   int endMarkerMs_ = -1;
+  bool dragging_ = false;
 };
 
 // No PreviewWorker needed — multi-track audio is handled by auxiliary
@@ -672,7 +730,8 @@ private:
   }
 
   bool needsRenderedAudioFilter() const {
-    return hasAdjustedAudioGains() || req_.selectedAudioStreamIndices.size() > 1;
+    return hasAdjustedAudioGains() ||
+           req_.selectedAudioStreamIndices.size() > 1;
   }
 
   float selectedAudioGainAt(int index) const {
@@ -716,9 +775,11 @@ private:
         QStringList inputs;
         for (int i = 0; i < req_.selectedAudioStreamIndices.size(); ++i)
           inputs << QString("[a%1]").arg(i);
-        filters << QString("%1amix=inputs=%2:duration=longest:normalize=0[aout]")
+        filters << QString(
+                       "%1amix=inputs=%2:duration=longest:normalize=0[aout]")
                        .arg(inputs.join(""),
-                            QString::number(req_.selectedAudioStreamIndices.size()));
+                            QString::number(
+                                req_.selectedAudioStreamIndices.size()));
       }
       cmd << "-filter_complex" << filters.join(";") << "-map" << "[aout]";
     } else {
@@ -997,7 +1058,24 @@ protected:
     cleanupPreviewTemp();
     QMainWindow::closeEvent(event);
   }
+  void keyPressEvent(QKeyEvent *event) override {
+    if (handleSeekKeyEvent(event))
+      return;
+    QMainWindow::keyPressEvent(event);
+  }
   bool eventFilter(QObject *obj, QEvent *event) override {
+    if (event->type() == QEvent::KeyPress) {
+      auto *ke = static_cast<QKeyEvent *>(event);
+      if (handleSeekKeyEvent(ke))
+        return true;
+    }
+    if (event->type() == QEvent::MouseButtonRelease) {
+      auto *me = static_cast<QMouseEvent *>(event);
+      if (me->button() == Qt::LeftButton && handleAudioTrackClick(obj)) {
+        me->accept();
+        return true;
+      }
+    }
     // Forward drag/drop from any child widget to this window
     if (obj != this && isAncestorOf(qobject_cast<QWidget *>(obj))) {
       if (event->type() == QEvent::DragEnter) {
@@ -1042,6 +1120,49 @@ protected:
   }
 
 private:
+  bool handleSeekKeyEvent(QKeyEvent *event) {
+    const auto key = event->key();
+    if (key != Qt::Key_Left && key != Qt::Key_Right)
+      return false;
+    if (!player_ || player_->source().isEmpty())
+      return false;
+
+    QWidget *fw = QApplication::focusWidget();
+    const bool editingField =
+        qobject_cast<QLineEdit *>(fw) || qobject_cast<QSpinBox *>(fw);
+    const bool forceSeek = event->modifiers().testFlag(Qt::ControlModifier);
+    if (editingField && !forceSeek)
+      return false;
+
+    seekRelative(key == Qt::Key_Right ? 5000 : -5000);
+    event->accept();
+    return true;
+  }
+
+  bool handleAudioTrackClick(QObject *obj) {
+    auto *clickedWidget = qobject_cast<QWidget *>(obj);
+    if (!clickedWidget)
+      return false;
+    if (qobject_cast<QCheckBox *>(clickedWidget) ||
+        qobject_cast<QSlider *>(clickedWidget) ||
+        qobject_cast<QSpinBox *>(clickedWidget) ||
+        qobject_cast<QLineEdit *>(clickedWidget))
+      return false;
+
+    QWidget *row = clickedWidget;
+    while (row && row != audioTrackListWidget_) {
+      if (row->property("streamIndex").isValid()) {
+        auto *cb = row->findChild<QCheckBox *>("trackCb");
+        if (!cb)
+          return false;
+        cb->setChecked(!cb->isChecked());
+        return true;
+      }
+      row = row->parentWidget();
+    }
+    return false;
+  }
+
   void setupUi() {
     setWindowTitle("Video Cut + Compress");
     resize(1100, 750);
@@ -1108,14 +1229,34 @@ private:
     srcGrpLayout->addWidget(makeLabel("File path:"));
     srcGrpLayout->addLayout(fileRow);
 
-    audioTrackList_ = new QListWidget(this);
-    audioTrackList_->setSelectionMode(QAbstractItemView::NoSelection);
-    audioTrackList_->setMinimumHeight(108);
-    audioTrackList_->setMaximumHeight(140);
-    audioTrackList_->setStyleSheet(
-        "QListWidget { background-color: #0f141a; border: 1px solid #344353; "
-        "border-radius: 6px; padding: 4px; }"
-        "QListWidget::item { padding: 3px 4px; }");
+    audioTrackScroll_ = new QScrollArea(this);
+    audioTrackScroll_->setObjectName("audioTrackScroll");
+    audioTrackScroll_->setWidgetResizable(true);
+    audioTrackScroll_->setMinimumHeight(180);
+    audioTrackScroll_->setMaximumHeight(280);
+    audioTrackScroll_->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    audioTrackScroll_->setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+    audioTrackScroll_->setStyleSheet(
+        "QScrollArea#audioTrackScroll { background-color: #0f141a; "
+        "border: 1px solid #344353; border-radius: 6px; }"
+        "QScrollArea#audioTrackScroll > QWidget > QWidget { "
+        "background-color: #0f141a; }"
+        "QScrollBar:vertical { background: #0f141a; width: 8px; "
+        "margin: 4px 2px 4px 0; border: none; }"
+        "QScrollBar::handle:vertical { background: #344353; "
+        "border-radius: 4px; min-height: 24px; }"
+        "QScrollBar::handle:vertical:hover { background: #43566b; }"
+        "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { "
+        "height: 0px; border: none; background: transparent; }"
+        "QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { "
+        "background: transparent; }");
+
+    audioTrackListWidget_ = new QWidget(audioTrackScroll_);
+    audioTrackListWidget_->setObjectName("audioTrackListWidget");
+    audioTrackListLayout_ = new QVBoxLayout(audioTrackListWidget_);
+    audioTrackListLayout_->setContentsMargins(6, 5, 6, 5);
+    audioTrackListLayout_->setSpacing(6);
+    audioTrackScroll_->setWidget(audioTrackListWidget_);
 
     auto *audioButtonsRow = new QHBoxLayout();
     audioButtonsRow->setContentsMargins(0, 0, 0, 0);
@@ -1131,10 +1272,8 @@ private:
     audioButtonsRow->addStretch(1);
 
     srcGrpLayout->addWidget(makeLabel("Audio tracks to keep:"));
-    srcGrpLayout->addWidget(audioTrackList_);
+    srcGrpLayout->addWidget(audioTrackScroll_);
     srcGrpLayout->addLayout(audioButtonsRow);
-    connect(audioTrackList_, &QListWidget::itemChanged, this,
-            [this](QListWidgetItem *) { handleAudioSelectionChanged(); });
     leftLayout->addWidget(srcGroup);
 
     // --- 2. Target Settings ---
@@ -1269,9 +1408,24 @@ private:
     controlsLayout->setSpacing(12);
 
     positionSlider_ = new SeekSlider(Qt::Horizontal, this);
+    positionSlider_->setObjectName("timelineSlider");
     positionSlider_->setRange(0, 0);
     positionSlider_->setSingleStep(1000);
     positionSlider_->setPageStep(5000);
+    positionSlider_->setFixedHeight(26);
+    positionSlider_->setStyleSheet(
+        "QSlider#timelineSlider { background: transparent; border: none; }"
+        "QSlider#timelineSlider::groove:horizontal { height: 8px; "
+        "background: #253241; border-radius: 4px; }"
+        "QSlider#timelineSlider::sub-page:horizontal { background: #3d8bfd; "
+        "border-radius: 4px; }"
+        "QSlider#timelineSlider::add-page:horizontal { background: #253241; "
+        "border-radius: 4px; }"
+        "QSlider#timelineSlider::handle:horizontal { background: #4d9bff; "
+        "border: 1px solid #2f6fd0; width: 16px; margin: -6px 0; "
+        "border-radius: 8px; }"
+        "QSlider#timelineSlider::handle:horizontal:hover { "
+        "background: #6bb0ff; border-color: #4d9bff; }");
     connect(positionSlider_, &QSlider::sliderPressed, this,
             &MainWindow::onSliderPressed);
     connect(positionSlider_, &QSlider::sliderReleased, this,
@@ -1279,10 +1433,16 @@ private:
     connect(positionSlider_, &QSlider::sliderMoved, this,
             &MainWindow::onSliderMoved);
     timeLabel_ = new QLabel("00:00 / 00:00", this);
-    timeLabel_->setMinimumWidth(80);
-    timeLabel_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    timeLabel_->setMinimumWidth(104);
+    timeLabel_->setAlignment(Qt::AlignCenter);
+    timeLabel_->setStyleSheet(
+        "QLabel { background: #101821; color: #dce8f5; "
+        "border: 1px solid #304050; border-radius: 6px; "
+        "padding: 4px 8px; font-size: 11px; font-weight: 600; }");
 
     auto *tlLayout = new QHBoxLayout();
+    tlLayout->setContentsMargins(0, 0, 0, 0);
+    tlLayout->setSpacing(12);
     tlLayout->addWidget(positionSlider_, 1);
     tlLayout->addWidget(timeLabel_);
     controlsLayout->addLayout(tlLayout);
@@ -1765,31 +1925,44 @@ private:
     return cachedAudioTracks_;
   }
 
+  QVector<QWidget *> audioTrackRows() const {
+    QVector<QWidget *> rows;
+    if (!audioTrackListLayout_)
+      return rows;
+    for (int i = 0; i < audioTrackListLayout_->count(); ++i) {
+      auto *layoutItem = audioTrackListLayout_->itemAt(i);
+      auto *row = layoutItem ? layoutItem->widget() : nullptr;
+      if (row && row->property("streamIndex").isValid())
+        rows.push_back(row);
+    }
+    return rows;
+  }
+
+  void clearAudioTrackRows() {
+    if (!audioTrackListLayout_)
+      return;
+    while (auto *layoutItem = audioTrackListLayout_->takeAt(0)) {
+      if (auto *w = layoutItem->widget())
+        delete w;
+      delete layoutItem;
+    }
+  }
+
   QVector<int> checkedAudioStreamIndices() const {
     QVector<int> streamIndices;
-    if (!audioTrackList_)
-      return streamIndices;
-    for (int i = 0; i < audioTrackList_->count(); ++i) {
-      auto *item = audioTrackList_->item(i);
-      if (!item)
-        continue;
-      auto *w = audioTrackList_->itemWidget(item);
-      auto *cb = w ? w->findChild<QCheckBox *>("trackCb") : nullptr;
+    for (auto *row : audioTrackRows()) {
+      auto *cb = row->findChild<QCheckBox *>("trackCb");
       if (cb && cb->isChecked())
-        streamIndices.push_back(item->data(Qt::UserRole).toInt());
+        streamIndices.push_back(row->property("streamIndex").toInt());
     }
     return streamIndices;
   }
 
   float getTrackVolumeAtIndex(int listIndex) const {
-    if (!audioTrackList_ || listIndex < 0 ||
-        listIndex >= audioTrackList_->count())
+    const auto rows = audioTrackRows();
+    if (listIndex < 0 || listIndex >= rows.size())
       return 1.0f;
-    auto *item = audioTrackList_->item(listIndex);
-    if (!item)
-      return 1.0f;
-    auto *w = audioTrackList_->itemWidget(item);
-    auto *sl = w ? w->findChild<QSlider *>("trackVol") : nullptr;
+    auto *sl = rows.at(listIndex)->findChild<QSlider *>("trackVol");
     return sl ? sliderToGain(sl->value()) : 1.0f;
   }
 
@@ -1806,14 +1979,8 @@ private:
   }
 
   void setAllAudioTracksChecked(Qt::CheckState state) {
-    if (!audioTrackList_)
-      return;
-    for (int i = 0; i < audioTrackList_->count(); ++i) {
-      auto *item = audioTrackList_->item(i);
-      if (!item)
-        continue;
-      auto *w = audioTrackList_->itemWidget(item);
-      auto *cb = w ? w->findChild<QCheckBox *>("trackCb") : nullptr;
+    for (auto *row : audioTrackRows()) {
+      auto *cb = row->findChild<QCheckBox *>("trackCb");
       if (cb) {
         QSignalBlocker blocker(cb);
         cb->setCheckState(state);
@@ -1823,12 +1990,12 @@ private:
   }
 
   void refreshAudioTrackList() {
-    if (!audioTrackList_)
+    if (!audioTrackListLayout_ || !audioTrackScroll_)
       return;
     const QString path = videoPathEdit_->text().trimmed();
     if (path.isEmpty() || !QFileInfo::exists(path)) {
-      audioTrackList_->clear();
-      audioTrackList_->setEnabled(false);
+      clearAudioTrackRows();
+      audioTrackScroll_->setEnabled(false);
       selectAllAudioButton_->setEnabled(false);
       deselectAllAudioButton_->setEnabled(false);
       return;
@@ -1837,81 +2004,162 @@ private:
     QSet<int> checkedTracks;
     QMap<int, int> savedVolumes; // streamIndex -> volume 0-100
     bool hadWidgetItems = false;
-    for (int i = 0; i < audioTrackList_->count(); ++i) {
-      auto *item = audioTrackList_->item(i);
-      if (!item)
-        continue;
-      auto *w = audioTrackList_->itemWidget(item);
-      if (!w)
-        continue;
+    for (auto *row : audioTrackRows()) {
       hadWidgetItems = true;
-      const int streamIdx = item->data(Qt::UserRole).toInt();
-      auto *cb = w->findChild<QCheckBox *>("trackCb");
+      const int streamIdx = row->property("streamIndex").toInt();
+      auto *cb = row->findChild<QCheckBox *>("trackCb");
       if (cb && cb->isChecked())
         checkedTracks.insert(streamIdx);
-      auto *sl = w->findChild<QSlider *>("trackVol");
+      auto *sl = row->findChild<QSlider *>("trackVol");
       if (sl)
         savedVolumes[streamIdx] = sl->value();
     }
 
     const auto tracks = probeAudioTracks(path);
-    audioTrackList_->clear();
+    clearAudioTrackRows();
     if (tracks.isEmpty()) {
-      auto *item = new QListWidgetItem("No audio track detected");
-      item->setFlags(Qt::NoItemFlags);
-      audioTrackList_->addItem(item);
-      audioTrackList_->setEnabled(false);
+      auto *empty =
+          new QLabel("No audio track detected", audioTrackListWidget_);
+      empty->setAlignment(Qt::AlignCenter);
+      empty->setMinimumHeight(48);
+      empty->setStyleSheet(
+          "color: #7f8fa1; background: transparent; border: none;");
+      audioTrackListLayout_->addWidget(empty);
+      audioTrackListLayout_->addStretch(1);
+      audioTrackScroll_->setEnabled(false);
       selectAllAudioButton_->setEnabled(false);
       deselectAllAudioButton_->setEnabled(false);
       return;
     }
 
     for (const auto &track : tracks) {
-      auto *item = new QListWidgetItem(audioTrackList_);
-      item->setData(Qt::UserRole, track.streamIndex);
-      item->setFlags(item->flags() & ~Qt::ItemIsUserCheckable);
-      item->setSizeHint(QSize(-1, 30));
+      auto *row = new QWidget(audioTrackListWidget_);
+      row->setObjectName("audioTrackRow");
+      row->setProperty("streamIndex", track.streamIndex);
+      row->setMinimumHeight(72);
+      row->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
+      row->setCursor(Qt::PointingHandCursor);
+      row->setStyleSheet(
+          "QWidget#audioTrackRow { background-color: #131a22; "
+          "border: 1px solid #223040; border-radius: 6px; }"
+          "QWidget#audioTrackTop, QWidget#audioTrackVolumeRow { "
+          "background: transparent; border: none; }"
+          "QCheckBox#trackCb { background: transparent; border: none; }"
+          "QCheckBox#trackCb::indicator { width: 15px; height: 15px; "
+          "border: 1px solid #53677d; border-radius: 3px; "
+          "background: #0f141a; }"
+          "QCheckBox#trackCb::indicator:hover { border-color: #7aa7e8; "
+          "background: #152235; }"
+          "QCheckBox#trackCb::indicator:checked { border-color: #3d8bfd; "
+          "background: qradialgradient(cx:0.5, cy:0.5, radius:0.55, "
+          "fx:0.5, fy:0.5, stop:0 #5aa0ff, stop:0.42 #5aa0ff, "
+          "stop:0.48 #0f141a, stop:1 #0f141a); image: none; }"
+          "QCheckBox#trackCb::indicator:checked:hover { "
+          "border-color: #7bb5ff; "
+          "background: qradialgradient(cx:0.5, cy:0.5, radius:0.55, "
+          "fx:0.5, fy:0.5, stop:0 #5aa0ff, stop:0.42 #5aa0ff, "
+          "stop:0.48 #152235, stop:1 #152235); }"
+          "QLabel#audioTrackText { color: #d0dce8; background: transparent; "
+          "border: none; }"
+          "QLabel#audioVolumeCaption { color: #7f8fa1; "
+          "background: transparent; border: none; font-size: 11px; }"
+          "QSlider { background: transparent; border: none; }");
+      auto *rowLayout = new QVBoxLayout(row);
+      rowLayout->setContentsMargins(9, 6, 9, 6);
+      rowLayout->setSpacing(4);
 
-      auto *row = new QWidget();
-      row->setStyleSheet("background: transparent;");
-      auto *hLayout = new QHBoxLayout(row);
-      hLayout->setContentsMargins(4, 1, 8, 1);
-      hLayout->setSpacing(8);
+      auto *topRow = new QWidget(row);
+      topRow->setObjectName("audioTrackTop");
+      topRow->setCursor(Qt::PointingHandCursor);
+      auto *topLayout = new QHBoxLayout(topRow);
+      topLayout->setContentsMargins(0, 0, 0, 0);
+      topLayout->setSpacing(8);
 
-      auto *cb = new QCheckBox(track.label, row);
+      auto *cb = new QCheckBox(topRow);
       cb->setObjectName("trackCb");
       cb->setChecked(!hadWidgetItems ||
                      checkedTracks.contains(track.streamIndex));
-      cb->setStyleSheet("color: #d0dce8;");
+      cb->setFixedSize(18, 22);
+
+      auto *trackLabel = new QLabel(track.label, topRow);
+      trackLabel->setObjectName("audioTrackText");
+      trackLabel->setWordWrap(true);
+      trackLabel->setToolTip(track.label);
+      trackLabel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+      trackLabel->setCursor(Qt::PointingHandCursor);
 
       const int initVol = savedVolumes.value(track.streamIndex, 100);
       auto *volSlider = new QSlider(Qt::Horizontal, row);
       volSlider->setObjectName("trackVol");
       volSlider->setRange(0, 200);
       volSlider->setValue(initVol);
-      volSlider->setFixedWidth(70);
+      volSlider->setMinimumWidth(120);
+      volSlider->setFixedHeight(18);
+      volSlider->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
       volSlider->setToolTip("Track volume");
+      volSlider->setStyleSheet(
+          "QSlider#trackVol { background: transparent; border: none; }"
+          "QSlider#trackVol::groove:horizontal { height: 5px; "
+          "background: #2b3642; border-radius: 2px; }"
+          "QSlider#trackVol::sub-page:horizontal { background: #3d8bfd; "
+          "border-radius: 2px; }"
+          "QSlider#trackVol::add-page:horizontal { background: #2b3642; "
+          "border-radius: 2px; }"
+          "QSlider#trackVol::handle:horizontal { background: #3d8bfd; "
+          "border: 1px solid #2f6fd0; width: 12px; margin: -5px 0; "
+          "border-radius: 6px; }"
+          "QSlider#trackVol::handle:horizontal:hover { "
+          "background: #5aa0ff; }");
 
-      auto *volLabel = new QLabel(QString("%1%").arg(initVol), row);
-      volLabel->setObjectName("trackVolLabel");
-      volLabel->setFixedWidth(36);
-      volLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
-      volLabel->setStyleSheet("color: #8899aa; font-size: 10px;");
+      auto *volInput = new QSpinBox(row);
+      volInput->setObjectName("trackVolInput");
+      volInput->setRange(0, 200);
+      volInput->setValue(initVol);
+      volInput->setSuffix("%");
+      volInput->setFixedWidth(64);
+      volInput->setFixedHeight(28);
+      volInput->setAlignment(Qt::AlignRight);
+      volInput->setButtonSymbols(QAbstractSpinBox::NoButtons);
+      volInput->setToolTip("Track volume percentage");
 
-      hLayout->addWidget(cb, 1);
-      hLayout->addWidget(volSlider);
-      hLayout->addWidget(volLabel);
+      auto *volumeRow = new QWidget(row);
+      volumeRow->setObjectName("audioTrackVolumeRow");
+      auto *volumeLayout = new QHBoxLayout(volumeRow);
+      volumeLayout->setContentsMargins(26, 0, 0, 0);
+      volumeLayout->setSpacing(7);
+
+      auto *volCaption = new QLabel("Volume", volumeRow);
+      volCaption->setObjectName("audioVolumeCaption");
+      volCaption->setFixedWidth(48);
+      volCaption->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+
+      topLayout->addWidget(cb);
+      topLayout->addWidget(trackLabel, 1);
+      volumeLayout->addWidget(volCaption);
+      volumeLayout->addWidget(volSlider, 1);
+      volumeLayout->addWidget(volInput);
+
+      rowLayout->addWidget(topRow);
+      rowLayout->addWidget(volumeRow);
 
       connect(cb, &QCheckBox::checkStateChanged, this,
               [this]() { handleAudioSelectionChanged(); });
-      connect(volSlider, &QSlider::valueChanged, this, [this, volLabel](int v) {
-        volLabel->setText(QString("%1%").arg(v));
+      connect(volSlider, &QSlider::valueChanged, this, [this, volInput](int v) {
+        QSignalBlocker blocker(volInput);
+        volInput->setValue(v);
         syncPreviewAudioSelection();
       });
+      connect(volInput, qOverload<int>(&QSpinBox::valueChanged), this,
+              [this, volSlider](int v) {
+                QSignalBlocker blocker(volSlider);
+                volSlider->setValue(v);
+                syncPreviewAudioSelection();
+              });
 
-      audioTrackList_->setItemWidget(item, row);
+      audioTrackListLayout_->addWidget(row);
     }
-    audioTrackList_->setEnabled(true);
+    audioTrackListLayout_->addStretch(1);
+    audioTrackScroll_->setEnabled(true);
     selectAllAudioButton_->setEnabled(true);
     deselectAllAudioButton_->setEnabled(true);
     setupAuxPlayersForSource(path);
@@ -2125,20 +2373,15 @@ private:
     req.mediaInfo = probeMediaInfo(req.path);
     if (!req.mediaInfo.ok)
       return {req, "Unable to read video information"};
-    if (audioTrackList_) {
-      for (int i = 0; i < audioTrackList_->count(); ++i) {
-        auto *item = audioTrackList_->item(i);
-        if (!item)
-          continue;
-        auto *w = audioTrackList_->itemWidget(item);
-        auto *cb = w ? w->findChild<QCheckBox *>("trackCb") : nullptr;
+    if (audioTrackListLayout_) {
+      for (auto *row : audioTrackRows()) {
+        auto *cb = row->findChild<QCheckBox *>("trackCb");
         if (!cb || !cb->isChecked())
           continue;
         req.selectedAudioStreamIndices.push_back(
-            item->data(Qt::UserRole).toInt());
-        auto *sl = w->findChild<QSlider *>("trackVol");
-        req.selectedAudioGains.push_back(sl ? sliderToGain(sl->value())
-                                            : 1.0f);
+            row->property("streamIndex").toInt());
+        auto *sl = row->findChild<QSlider *>("trackVol");
+        req.selectedAudioGains.push_back(sl ? sliderToGain(sl->value()) : 1.0f);
       }
     }
 
@@ -2567,7 +2810,9 @@ private:
   QLineEdit *videoPathEdit_, *startEdit_, *endEdit_, *maxSizeEdit_,
       *presetVideoKbpsEdit_, *presetAudioKbpsEdit_, *presetWidthLimitEdit_;
   QComboBox *modeCombo_, *presetCombo_, *presetFfmpegCombo_;
-  QListWidget *audioTrackList_ = nullptr;
+  QScrollArea *audioTrackScroll_ = nullptr;
+  QWidget *audioTrackListWidget_ = nullptr;
+  QVBoxLayout *audioTrackListLayout_ = nullptr;
   QLabel *maxSizeLabel_, *infoLabel_, *timeLabel_, *statusLabel_;
   QLabel *previewIndicatorLabel_ = nullptr;
   QFrame *previewBadgeWrap_ = nullptr;
