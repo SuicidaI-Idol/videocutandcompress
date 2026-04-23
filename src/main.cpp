@@ -1069,13 +1069,6 @@ protected:
       if (handleSeekKeyEvent(ke))
         return true;
     }
-    if (event->type() == QEvent::MouseButtonRelease) {
-      auto *me = static_cast<QMouseEvent *>(event);
-      if (me->button() == Qt::LeftButton && handleAudioTrackClick(obj)) {
-        me->accept();
-        return true;
-      }
-    }
     // Forward drag/drop from any child widget to this window
     if (obj != this && isAncestorOf(qobject_cast<QWidget *>(obj))) {
       if (event->type() == QEvent::DragEnter) {
@@ -1137,30 +1130,6 @@ private:
     seekRelative(key == Qt::Key_Right ? 5000 : -5000);
     event->accept();
     return true;
-  }
-
-  bool handleAudioTrackClick(QObject *obj) {
-    auto *clickedWidget = qobject_cast<QWidget *>(obj);
-    if (!clickedWidget)
-      return false;
-    if (qobject_cast<QCheckBox *>(clickedWidget) ||
-        qobject_cast<QSlider *>(clickedWidget) ||
-        qobject_cast<QSpinBox *>(clickedWidget) ||
-        qobject_cast<QLineEdit *>(clickedWidget))
-      return false;
-
-    QWidget *row = clickedWidget;
-    while (row && row != audioTrackListWidget_) {
-      if (row->property("streamIndex").isValid()) {
-        auto *cb = row->findChild<QCheckBox *>("trackCb");
-        if (!cb)
-          return false;
-        cb->setChecked(!cb->isChecked());
-        return true;
-      }
-      row = row->parentWidget();
-    }
-    return false;
   }
 
   void setupUi() {
@@ -2038,7 +2007,6 @@ private:
       row->setProperty("streamIndex", track.streamIndex);
       row->setMinimumHeight(72);
       row->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
-      row->setCursor(Qt::PointingHandCursor);
       row->setStyleSheet(
           "QWidget#audioTrackRow { background-color: #131a22; "
           "border: 1px solid #223040; border-radius: 6px; }"
@@ -2070,7 +2038,6 @@ private:
 
       auto *topRow = new QWidget(row);
       topRow->setObjectName("audioTrackTop");
-      topRow->setCursor(Qt::PointingHandCursor);
       auto *topLayout = new QHBoxLayout(topRow);
       topLayout->setContentsMargins(0, 0, 0, 0);
       topLayout->setSpacing(8);
@@ -2086,7 +2053,6 @@ private:
       trackLabel->setWordWrap(true);
       trackLabel->setToolTip(track.label);
       trackLabel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
-      trackLabel->setCursor(Qt::PointingHandCursor);
 
       const int initVol = savedVolumes.value(track.streamIndex, 100);
       auto *volSlider = new QSlider(Qt::Horizontal, row);
