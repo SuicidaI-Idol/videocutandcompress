@@ -1,22 +1,22 @@
 {
   "cmake.configureOnOpen": true,
-  "cmake.cmakePath": "C:/Qt/Tools/CMake_64/bin/cmake.exe",
+  "cmake.cmakePath": "${env:QT_CMAKE_DIR}/bin/cmake.exe",
   "cmake.generator": "Ninja",
   "cmake.buildDirectory": "${workspaceFolder}/build",
   "cmake.configureSettings": {
     "CMAKE_BUILD_TYPE": "Debug",
     "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
-    "CMAKE_PREFIX_PATH": "C:/Qt/6.11.1/mingw_64",
-    "CMAKE_C_COMPILER": "C:/Qt/Tools/mingw1310_64/bin/gcc.exe",
-    "CMAKE_CXX_COMPILER": "C:/Qt/Tools/mingw1310_64/bin/g++.exe",
-    "CMAKE_MAKE_PROGRAM": "C:/Qt/Tools/Ninja/ninja.exe"
+    "CMAKE_PREFIX_PATH": "${env:QT_SDK_DIR}",
+    "CMAKE_C_COMPILER": "${env:QT_MINGW_DIR}/bin/gcc.exe",
+    "CMAKE_CXX_COMPILER": "${env:QT_MINGW_DIR}/bin/g++.exe",
+    "CMAKE_MAKE_PROGRAM": "${env:QT_NINJA_DIR}/ninja.exe"
   },
   "cmake.configureEnvironment": {
-    "PATH": "C:/Qt/Tools/CMake_64/bin;C:/Qt/Tools/Ninja;C:/Qt/Tools/mingw1310_64/bin;${env:PATH}"
+    "PATH": "${env:QT_CMAKE_DIR}/bin;${env:QT_NINJA_DIR};${env:QT_MINGW_DIR}/bin;${env:QT_SDK_DIR}/bin;${env:PATH}"
   },
   "C_Cpp.default.compileCommands": "${workspaceFolder}/build/compile_commands.json",
   "C_Cpp.default.intelliSenseMode": "windows-gcc-x64",
-  "C_Cpp.default.compilerPath": "C:/Qt/Tools/mingw1310_64/bin/g++.exe",
+  "C_Cpp.default.compilerPath": "${env:QT_MINGW_DIR}/bin/g++.exe",
   "clangd.enable": false,
   "files.associations": {
     "optional": "cpp"

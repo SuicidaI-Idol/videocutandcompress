@@ -29,6 +29,22 @@ Simple Windows desktop app to cut, preview, and compress videos with FFmpeg thro
 - FFmpeg is bundled in the installer
 - No manual Qt DLL setup required after installation
 
+## Development
+
+The VS Code configuration uses environment variables instead of machine-specific
+Qt paths. Define them for your Qt installation, then restart VS Code:
+
+```powershell
+setx QT_SDK_DIR "C:\Qt\6.11.1\mingw_64"
+setx QT_MINGW_DIR "C:\Qt\Tools\mingw1310_64"
+setx QT_CMAKE_DIR "C:\Qt\Tools\CMake_64"
+setx QT_NINJA_DIR "C:\Qt\Tools\Ninja"
+```
+
+Qt 6.8 or newer is required with Widgets, Multimedia, and MultimediaWidgets.
+Press `F5` to build and debug, or run the `Build Installer (Release)` VS Code
+task to create the Windows installer.
+
 ## Output
 
 Exported files are created next to the original video with an auto-generated name based on:
