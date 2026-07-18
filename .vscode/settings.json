@@ -6,7 +6,7 @@
   "cmake.configureSettings": {
     "CMAKE_BUILD_TYPE": "Debug",
     "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
-    "CMAKE_PREFIX_PATH": "C:/Qt/6.9.0/mingw_64",
+    "CMAKE_PREFIX_PATH": "C:/Qt/6.11.1/mingw_64",
     "CMAKE_C_COMPILER": "C:/Qt/Tools/mingw1310_64/bin/gcc.exe",
     "CMAKE_CXX_COMPILER": "C:/Qt/Tools/mingw1310_64/bin/g++.exe",
     "CMAKE_MAKE_PROGRAM": "C:/Qt/Tools/Ninja/ninja.exe"
@@ -17,6 +17,7 @@
   "C_Cpp.default.compileCommands": "${workspaceFolder}/build/compile_commands.json",
   "C_Cpp.default.intelliSenseMode": "windows-gcc-x64",
   "C_Cpp.default.compilerPath": "C:/Qt/Tools/mingw1310_64/bin/g++.exe",
+  "clangd.enable": false,
   "files.associations": {
     "optional": "cpp"
   },

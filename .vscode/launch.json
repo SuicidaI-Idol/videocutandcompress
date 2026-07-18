@@ -12,7 +12,7 @@
       "environment": [
         {
           "name": "PATH",
-          "value": "C:/Qt/6.9.0/mingw_64/bin;C:/Qt/Tools/mingw1310_64/bin;${env:PATH}"
+          "value": "C:/Qt/6.11.1/mingw_64/bin;C:/Qt/Tools/mingw1310_64/bin;${workspaceFolder}/build-release;${env:PATH}"
         }
       ],
       "externalConsole": false,

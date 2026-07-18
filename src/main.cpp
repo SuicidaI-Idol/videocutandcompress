@@ -336,34 +336,59 @@ struct Request {
   QVector<float> selectedAudioGains;
 };
 
-QString padTime(const QString &value) {
+std::optional<qint64> parseTimeSeconds(const QString &value) {
   const QStringList parts = value.trimmed().split(':');
   bool ok = false;
+  if (parts.size() == 1) {
+    const qint64 t = parts[0].toLongLong(&ok);
+    if (!ok || t < 0)
+      return std::nullopt;
+    return t;
+  }
   if (parts.size() == 2) {
-    const int mm = parts[0].toInt(&ok);
+    const qint64 mm = parts[0].toLongLong(&ok);
     if (!ok)
-      return {};
+      return std::nullopt;
     const int ss = parts[1].toInt(&ok);
     if (!ok || mm < 0 || ss < 0 || ss >= 60)
-      return {};
-    return QString("%1:%2")
-        .arg(mm, 2, 10, QChar('0'))
-        .arg(ss, 2, 10, QChar('0'));
+      return std::nullopt;
+    return mm * 60 + ss;
   }
-  if (parts.size() == 1) {
-    const int t = parts[0].toInt(&ok);
-    if (!ok || t < 0)
-      return {};
-    return QString("%1:%2")
-        .arg(t / 60, 2, 10, QChar('0'))
-        .arg(t % 60, 2, 10, QChar('0'));
+  if (parts.size() == 3) {
+    const qint64 hh = parts[0].toLongLong(&ok);
+    if (!ok)
+      return std::nullopt;
+    const int mm = parts[1].toInt(&ok);
+    if (!ok)
+      return std::nullopt;
+    const int ss = parts[2].toInt(&ok);
+    if (!ok || hh < 0 || mm < 0 || mm >= 60 || ss < 0 || ss >= 60)
+      return std::nullopt;
+    return hh * 3600 + mm * 60 + ss;
   }
-  return {};
+  return std::nullopt;
 }
 
-int mmssToSeconds(const QString &mmss) {
-  const auto p = mmss.split(':');
-  return p.size() == 2 ? p[0].toInt() * 60 + p[1].toInt() : 0;
+QString formatSeconds(qint64 seconds) {
+  const qint64 t = qMax<qint64>(0, seconds);
+  if (t >= 3600) {
+    return QString("%1:%2:%3")
+        .arg(t / 3600, 2, 10, QChar('0'))
+        .arg((t / 60) % 60, 2, 10, QChar('0'))
+        .arg(t % 60, 2, 10, QChar('0'));
+  }
+  return QString("%1:%2")
+      .arg(t / 60, 2, 10, QChar('0'))
+      .arg(t % 60, 2, 10, QChar('0'));
+}
+
+QString padTime(const QString &value) {
+  const auto seconds = parseTimeSeconds(value);
+  return seconds ? formatSeconds(*seconds) : QString();
+}
+
+qint64 mmssToSeconds(const QString &value) {
+  return parseTimeSeconds(value).value_or(0);
 }
 
 int parseFfmpegProgress(const QString &line) {
@@ -557,10 +582,7 @@ QString buildOutputPath(const QString &inputPath, const QString &startLabel,
 }
 
 QString formatMs(qint64 ms) {
-  int s = qMax<qint64>(0, ms / 1000);
-  return QString("%1:%2")
-      .arg(s / 60, 2, 10, QChar('0'))
-      .arg(s % 60, 2, 10, QChar('0'));
+  return formatSeconds(qMax<qint64>(0, ms / 1000));
 }
 
 bool rmDir(const QString &p) {
@@ -865,7 +887,9 @@ private:
 
   void runCutOnly(int targetDuration) {
     emit status("Input mode: cut only");
-    QStringList cut{"-y", "-ss", "00:" + req_.startMmss, "-i", req_.path};
+    QStringList cut{"-y", "-ss",
+                    QString::number(mmssToSeconds(req_.startMmss)), "-i",
+                    req_.path};
     if (req_.durationSeconds > 0)
       cut << "-t" << QString::number(req_.durationSeconds);
     if (needsRenderedAudioFilter()) {
@@ -898,7 +922,9 @@ private:
       return;
     }
     QString cutPath = td.filePath("segment_temp.mp4");
-    QStringList cut{"-y", "-ss", "00:" + req_.startMmss, "-i", req_.path};
+    QStringList cut{"-y", "-ss",
+                    QString::number(mmssToSeconds(req_.startMmss)), "-i",
+                    req_.path};
     if (req_.durationSeconds > 0)
       cut << "-t" << QString::number(req_.durationSeconds);
     appendSelectedAudioMaps(cut, req_.selectedAudioStreamIndices);
@@ -951,7 +977,9 @@ private:
       return;
     }
     QString cutPath = td.filePath("segment_temp.mp4");
-    QStringList cut{"-y", "-ss", "00:" + req_.startMmss, "-i", req_.path};
+    QStringList cut{"-y", "-ss",
+                    QString::number(mmssToSeconds(req_.startMmss)), "-i",
+                    req_.path};
     if (req_.durationSeconds > 0)
       cut << "-t" << QString::number(req_.durationSeconds);
     appendSelectedAudioMaps(cut, req_.selectedAudioStreamIndices);
@@ -1493,10 +1521,10 @@ private:
 
     startEdit_ = new QLineEdit(this);
     endEdit_ = new QLineEdit(this);
-    startEdit_->setPlaceholderText("MM:SS");
-    endEdit_->setPlaceholderText("MM:SS");
-    startEdit_->setMaximumWidth(60);
-    endEdit_->setMaximumWidth(60);
+    startEdit_->setPlaceholderText("HH:MM:SS");
+    endEdit_->setPlaceholderText("HH:MM:SS");
+    startEdit_->setMaximumWidth(90);
+    endEdit_->setMaximumWidth(90);
     connect(startEdit_, &QLineEdit::textChanged, this,
             [this](const QString &) { onTrimInputsChanged(); });
     connect(endEdit_, &QLineEdit::textChanged, this,
@@ -2365,6 +2393,8 @@ private:
       if (req.endMmss.isEmpty())
         return {req, "Invalid end time"};
       int endSec = mmssToSeconds(req.endMmss);
+      if (endSec > static_cast<int>(std::ceil(req.mediaInfo.duration)))
+        return {req, "End time exceeds video duration"};
       req.durationSeconds = endSec - startSec;
       if (req.durationSeconds <= 0)
         return {req, "End time must be greater than start time"};
@@ -2388,6 +2418,24 @@ private:
       req.presetFfmpegPreset = presetFfmpegCombo_->currentText();
     }
     req.targetDuration = qMax(req.targetDuration, 1);
+    if (requireSize && req.compressMode == "target_size") {
+      constexpr int minimumVideoKbps = 70;
+      constexpr int minimumAudioKbps = 48;
+      constexpr int containerOverheadKbps = 8;
+      const int minimumTotalKbps =
+          minimumVideoKbps + containerOverheadKbps +
+          (req.selectedAudioStreamIndices.isEmpty() ? 0 : minimumAudioKbps);
+      const double minimumMb =
+          (minimumTotalKbps * 1000.0 * req.targetDuration) /
+          (8.0 * 1024.0 * 1024.0);
+      if (req.targetMb < minimumMb) {
+        return {req,
+                QString("Target size is too small for %1. Use at least about "
+                        "%2 MB.")
+                    .arg(formatSeconds(req.targetDuration))
+                    .arg(static_cast<int>(std::ceil(minimumMb)))};
+      }
+    }
     return {req, {}};
   }
 
@@ -2614,8 +2662,7 @@ private:
       return;
     }
     QString m = formatMs(player_->position());
-    startEdit_->setText(
-        QString("%1:%2").arg(m.left(2).toInt()).arg(m.mid(3, 2)));
+    startEdit_->setText(m);
     setStatus("Start marked at " + m + ".");
   }
   void markEndFromPlayer() {
@@ -2624,7 +2671,7 @@ private:
       return;
     }
     QString m = formatMs(player_->position());
-    endEdit_->setText(QString("%1:%2").arg(m.left(2).toInt()).arg(m.mid(3, 2)));
+    endEdit_->setText(m);
     setStatus("End marked at " + m + ".");
   }
 
