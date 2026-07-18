@@ -1523,8 +1523,8 @@ private:
     endEdit_ = new QLineEdit(this);
     startEdit_->setPlaceholderText("HH:MM:SS");
     endEdit_->setPlaceholderText("HH:MM:SS");
-    startEdit_->setMaximumWidth(90);
-    endEdit_->setMaximumWidth(90);
+    startEdit_->setFixedWidth(110);
+    endEdit_->setFixedWidth(110);
     connect(startEdit_, &QLineEdit::textChanged, this,
             [this](const QString &) { onTrimInputsChanged(); });
     connect(endEdit_, &QLineEdit::textChanged, this,
