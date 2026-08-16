@@ -21,6 +21,7 @@
 #include <QtGui/QCloseEvent>
 #include <QtGui/QDesktopServices>
 #include <QtGui/QDragEnterEvent>
+#include <QtGui/QDragMoveEvent>
 #include <QtGui/QIcon>
 #include <QtGui/QKeyEvent>
 #include <QtGui/QMouseEvent>
@@ -34,12 +35,15 @@
 #include <QtMultimedia/QAudioSink>
 #include <QtMultimedia/QMediaMetaData>
 #include <QtMultimedia/QMediaPlayer>
-#include <QtMultimediaWidgets/QVideoWidget>
+#include <QtMultimediaWidgets/QGraphicsVideoItem>
 #include <QtWidgets/QApplication>
 #include <QtWidgets/QCheckBox>
 #include <QtWidgets/QComboBox>
 #include <QtWidgets/QFileDialog>
 #include <QtWidgets/QFrame>
+#include <QtWidgets/QGraphicsRectItem>
+#include <QtWidgets/QGraphicsScene>
+#include <QtWidgets/QGraphicsView>
 #include <QtWidgets/QGridLayout>
 #include <QtWidgets/QHBoxLayout>
 #include <QtWidgets/QLabel>
@@ -334,6 +338,11 @@ struct Request {
   QString presetFfmpegPreset = "medium";
   QVector<int> selectedAudioStreamIndices;
   QVector<float> selectedAudioGains;
+  bool cropEnabled = false;
+  int cropX = 0;
+  int cropY = 0;
+  int cropWidth = 0;
+  int cropHeight = 0;
 };
 
 std::optional<qint64> parseTimeSeconds(const QString &value) {
@@ -707,6 +716,209 @@ private:
 // No PreviewWorker needed — multi-track audio is handled by auxiliary
 // QMediaPlayer instances playing in parallel with the main player.
 
+class CropVideoView : public QGraphicsView {
+  Q_OBJECT
+public:
+  explicit CropVideoView(QWidget *parent = nullptr) : QGraphicsView(parent) {
+    scene_ = new QGraphicsScene(this);
+    clipItem_ = new QGraphicsRectItem();
+    clipItem_->setPen(Qt::NoPen);
+    clipItem_->setFlag(QGraphicsItem::ItemClipsChildrenToShape, true);
+    scene_->addItem(clipItem_);
+    videoItem_ = new QGraphicsVideoItem(clipItem_);
+    selectionItem_ = scene_->addRect({}, QPen(QColor("#4d9bff"), 3),
+                                     QBrush(QColor(77, 155, 255, 45)));
+    selectionItem_->setZValue(10);
+    selectionItem_->hide();
+    setScene(scene_);
+    setBackgroundBrush(QColor("#0c1015"));
+    setFrameShape(QFrame::NoFrame);
+    setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    setRenderHints(QPainter::Antialiasing | QPainter::SmoothPixmapTransform |
+                   QPainter::TextAntialiasing);
+    setViewportUpdateMode(QGraphicsView::FullViewportUpdate);
+    setOptimizationFlag(QGraphicsView::DontAdjustForAntialiasing, true);
+    setAcceptDrops(true);
+    viewport()->setAcceptDrops(true);
+    setFocusPolicy(Qt::NoFocus);
+    videoItem_->setAspectRatioMode(Qt::IgnoreAspectRatio);
+    videoItem_->setCacheMode(QGraphicsItem::NoCache);
+  }
+
+  QGraphicsVideoItem *videoItem() const { return videoItem_; }
+  QRect cropRect() const { return cropRect_; }
+  bool hasCrop() const {
+    return sourceRect_.isValid() && cropRect_.isValid() &&
+           cropRect_ != sourceRect_.toAlignedRect();
+  }
+
+  void setSourceSize(const QSize &size, bool resetCrop = true) {
+    if (!size.isValid())
+      return;
+    sourceRect_ = QRectF(QPointF(0, 0), QSizeF(size));
+    clipItem_->setRect(sourceRect_);
+    videoItem_->setSize(QSizeF(size));
+    scene_->setSceneRect(sourceRect_);
+    if (resetCrop || !cropRect_.isValid())
+      cropRect_ = sourceRect_.toAlignedRect();
+    selecting_ = false;
+    selectionItem_->hide();
+    showCurrentCrop();
+  }
+
+  void beginCropSelection() {
+    if (!sourceRect_.isValid())
+      return;
+    selecting_ = true;
+    dragging_ = false;
+    clipItem_->setRect(sourceRect_);
+    scene_->setSceneRect(sourceRect_);
+    fitInView(sourceRect_, Qt::KeepAspectRatio);
+    selectionItem_->setRect(cropRect_);
+    selectionItem_->show();
+    viewport()->setCursor(Qt::CrossCursor);
+  }
+
+  void resetCrop() {
+    if (!sourceRect_.isValid())
+      return;
+    cropRect_ = sourceRect_.toAlignedRect();
+    selecting_ = false;
+    dragging_ = false;
+    selectionItem_->hide();
+    viewport()->unsetCursor();
+    showCurrentCrop();
+    emit cropChanged(cropRect_, false);
+  }
+
+signals:
+  void cropChanged(const QRect &rect, bool enabled);
+  void fileDropped(const QString &path);
+
+protected:
+  void dragEnterEvent(QDragEnterEvent *event) override {
+    if (event->mimeData()->hasUrls() &&
+        !event->mimeData()->urls().isEmpty() &&
+        event->mimeData()->urls().first().isLocalFile()) {
+      event->acceptProposedAction();
+      return;
+    }
+    QGraphicsView::dragEnterEvent(event);
+  }
+
+  void dragMoveEvent(QDragMoveEvent *event) override {
+    if (event->mimeData()->hasUrls()) {
+      event->acceptProposedAction();
+      return;
+    }
+    QGraphicsView::dragMoveEvent(event);
+  }
+
+  void dropEvent(QDropEvent *event) override {
+    const auto urls = event->mimeData()->urls();
+    if (!urls.isEmpty() && urls.first().isLocalFile()) {
+      const QString path =
+          QDir::toNativeSeparators(urls.first().toLocalFile());
+      if (!path.isEmpty()) {
+        emit fileDropped(path);
+        event->acceptProposedAction();
+        return;
+      }
+    }
+    QGraphicsView::dropEvent(event);
+  }
+
+  void resizeEvent(QResizeEvent *event) override {
+    QGraphicsView::resizeEvent(event);
+    fitVisibleRect();
+  }
+
+  void mousePressEvent(QMouseEvent *event) override {
+    if (!selecting_ || event->button() != Qt::LeftButton) {
+      QGraphicsView::mousePressEvent(event);
+      return;
+    }
+    dragging_ = true;
+    dragStart_ = boundedScenePoint(event->position().toPoint());
+    selectionItem_->setRect(QRectF(dragStart_, dragStart_));
+    event->accept();
+  }
+
+  void mouseMoveEvent(QMouseEvent *event) override {
+    if (!selecting_ || !dragging_) {
+      QGraphicsView::mouseMoveEvent(event);
+      return;
+    }
+    selectionItem_->setRect(
+        QRectF(dragStart_, boundedScenePoint(event->position().toPoint()))
+            .normalized());
+    event->accept();
+  }
+
+  void mouseReleaseEvent(QMouseEvent *event) override {
+    if (!selecting_ || !dragging_ || event->button() != Qt::LeftButton) {
+      QGraphicsView::mouseReleaseEvent(event);
+      return;
+    }
+    dragging_ = false;
+    QRectF chosen =
+        QRectF(dragStart_, boundedScenePoint(event->position().toPoint()))
+            .normalized()
+            .intersected(sourceRect_);
+    int x = qMax(0, (static_cast<int>(std::floor(chosen.x())) / 2) * 2);
+    int y = qMax(0, (static_cast<int>(std::floor(chosen.y())) / 2) * 2);
+    int w = (static_cast<int>(std::floor(chosen.width())) / 2) * 2;
+    int h = (static_cast<int>(std::floor(chosen.height())) / 2) * 2;
+    w = (qMin(w, static_cast<int>(sourceRect_.width()) - x) / 2) * 2;
+    h = (qMin(h, static_cast<int>(sourceRect_.height()) - y) / 2) * 2;
+    if (w < 16 || h < 16) {
+      selectionItem_->setRect(cropRect_);
+      event->accept();
+      return;
+    }
+    cropRect_ = QRect(x, y, w, h);
+    selecting_ = false;
+    selectionItem_->hide();
+    viewport()->unsetCursor();
+    showCurrentCrop();
+    emit cropChanged(cropRect_, hasCrop());
+    event->accept();
+  }
+
+private:
+  QPointF boundedScenePoint(const QPoint &viewPoint) const {
+    const QPointF p = mapToScene(viewPoint);
+    return QPointF(qBound(sourceRect_.left(), p.x(), sourceRect_.right()),
+                   qBound(sourceRect_.top(), p.y(), sourceRect_.bottom()));
+  }
+
+  void showCurrentCrop() {
+    if (!cropRect_.isValid())
+      return;
+    scene_->setSceneRect(cropRect_);
+    clipItem_->setRect(cropRect_);
+    fitInView(QRectF(cropRect_), Qt::KeepAspectRatio);
+  }
+
+  void fitVisibleRect() {
+    if (!sourceRect_.isValid())
+      return;
+    fitInView(selecting_ ? sourceRect_ : QRectF(cropRect_),
+              Qt::KeepAspectRatio);
+  }
+
+  QGraphicsScene *scene_ = nullptr;
+  QGraphicsRectItem *clipItem_ = nullptr;
+  QGraphicsVideoItem *videoItem_ = nullptr;
+  QGraphicsRectItem *selectionItem_ = nullptr;
+  QRectF sourceRect_;
+  QRect cropRect_;
+  QPointF dragStart_;
+  bool selecting_ = false;
+  bool dragging_ = false;
+};
+
 class CompressionWorker : public QThread {
   Q_OBJECT
 public:
@@ -760,6 +972,26 @@ private:
     if (index >= 0 && index < req_.selectedAudioGains.size())
       return req_.selectedAudioGains.at(index);
     return 1.0f;
+  }
+
+  QString cropFilter() const {
+    if (!req_.cropEnabled)
+      return {};
+    return QString("crop=%1:%2:%3:%4")
+        .arg(req_.cropWidth)
+        .arg(req_.cropHeight)
+        .arg(req_.cropX)
+        .arg(req_.cropY);
+  }
+
+  QString videoFilter(const QString &scale = {}) const {
+    QStringList filters;
+    const QString crop = cropFilter();
+    if (!crop.isEmpty())
+      filters << crop;
+    if (!scale.isEmpty())
+      filters << scale;
+    return filters.join(',');
   }
 
   QString audioInputSpec(int index, bool useOriginalStreamIndices) const {
@@ -818,8 +1050,9 @@ private:
                            const QString &passlog, const QString &scale,
                            bool includeAudio) const {
     QStringList cmd{"-y", "-i", path};
-    if (!scale.isEmpty())
-      cmd << "-vf" << scale;
+    const QString filter = videoFilter(scale);
+    if (!filter.isEmpty())
+      cmd << "-vf" << filter;
     cmd << "-map" << "0:v:0?";
     cmd << "-c:v" << "libx264" << "-preset" << preset << "-b:v"
         << QString::number(vk) + "k" << "-maxrate"
@@ -843,8 +1076,9 @@ private:
                                  const QString &preset, const QString &scale,
                                  bool includeAudio) const {
     QStringList cmd{"-y", "-i", path};
-    if (!scale.isEmpty())
-      cmd << "-vf" << scale;
+    const QString filter = videoFilter(scale);
+    if (!filter.isEmpty())
+      cmd << "-vf" << filter;
     cmd << "-map" << "0:v:0?" << "-c:v" << "libx264" << "-preset" << preset
         << "-b:v" << QString::number(vk) + "k" << "-maxrate"
         << QString::number(static_cast<int>(std::ceil(vk * 1.2))) + "k"
@@ -892,7 +1126,20 @@ private:
                     req_.path};
     if (req_.durationSeconds > 0)
       cut << "-t" << QString::number(req_.durationSeconds);
-    if (needsRenderedAudioFilter()) {
+    if (req_.cropEnabled) {
+      cut << "-map" << "0:v:0?" << "-vf" << cropFilter() << "-c:v"
+          << "libx264" << "-preset" << "medium" << "-crf" << "18";
+      if (needsRenderedAudioFilter()) {
+        appendSelectedAudioOutput(cut, 192, true);
+      } else if (hasSelectedAudio()) {
+        for (int streamIndex : req_.selectedAudioStreamIndices)
+          cut << "-map" << QString("0:%1").arg(streamIndex);
+        cut << "-c:a" << "copy";
+      } else {
+        cut << "-an";
+      }
+      cut << "-movflags" << "+faststart" << outputPath_;
+    } else if (needsRenderedAudioFilter()) {
       cut << "-map" << "0:v:0?" << "-c:v" << "copy";
       appendSelectedAudioOutput(cut, 192, true);
       cut << "-movflags" << "+faststart" << outputPath_;
@@ -938,11 +1185,13 @@ private:
 
     QString scale;
     MediaInfo info = getMediaInfo(cutPath);
+    const int inputWidth = req_.cropEnabled ? req_.cropWidth : info.width;
+    const int inputHeight = req_.cropEnabled ? req_.cropHeight : info.height;
     if (info.ok && req_.presetWidthLimit > 0 &&
-        info.width > req_.presetWidthLimit) {
+        inputWidth > req_.presetWidthLimit) {
       int h = even(
           static_cast<int>(req_.presetWidthLimit *
-                           (static_cast<double>(info.height) / info.width)));
+                           (static_cast<double>(inputHeight) / inputWidth)));
       scale = QString("scale=%1:%2").arg(even(req_.presetWidthLimit)).arg(h);
     }
 
@@ -1011,7 +1260,9 @@ private:
     int totalSteps = 1 + MAX_ATTEMPTS * 2;
 
     for (int a = 0; a < MAX_ATTEMPTS; ++a) {
-      QString scale = buildScaleFilter(info.width, info.height, videoKbps);
+      const int inputWidth = req_.cropEnabled ? req_.cropWidth : info.width;
+      const int inputHeight = req_.cropEnabled ? req_.cropHeight : info.height;
+      QString scale = buildScaleFilter(inputWidth, inputHeight, videoKbps);
       emit status(QString("Step 2/2  Compression  Attempt %1/%2  | video %3 "
                           "kb/s | audio %4 kb/s")
                       .arg(a + 1)
@@ -1079,8 +1330,8 @@ public:
 protected:
   void resizeEvent(QResizeEvent *event) override {
     QMainWindow::resizeEvent(event);
-    if (videoWidget_)
-      videoWidget_->updateGeometry();
+    if (cropVideoView_)
+      cropVideoView_->updateGeometry();
   }
   void closeEvent(QCloseEvent *event) override {
     cleanupPreviewTemp();
@@ -1385,11 +1636,11 @@ private:
     previewBadgeLayout->addWidget(previewBadgeCloseButton_);
     rightLayout->addWidget(previewBadgeWrap_, 0, Qt::AlignHCenter);
 
-    videoWidget_ = new QVideoWidget(this);
-    videoWidget_->setObjectName("previewView");
-    videoWidget_->setMinimumHeight(200);
-    videoWidget_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
-    videoWidget_->setFocusPolicy(Qt::NoFocus);
+    cropVideoView_ = new CropVideoView(this);
+    cropVideoView_->setObjectName("previewView");
+    cropVideoView_->setMinimumHeight(200);
+    cropVideoView_->setSizePolicy(QSizePolicy::Expanding,
+                                  QSizePolicy::Expanding);
 
     QFrame *videoFrame = new QFrame(this);
     videoFrame->setObjectName("videoFrame");
@@ -1397,8 +1648,42 @@ private:
                               "1px solid #333; border-radius: 6px; }");
     auto *vLayout = new QVBoxLayout(videoFrame);
     vLayout->setContentsMargins(0, 0, 0, 0);
-    vLayout->addWidget(videoWidget_);
+    vLayout->addWidget(cropVideoView_);
     rightLayout->addWidget(videoFrame, 1);
+
+    auto *cropRow = new QHBoxLayout();
+    cropRow->setContentsMargins(0, 0, 0, 0);
+    cropRow->setSpacing(8);
+    cropButton_ = new QPushButton("Select crop", this);
+    resetCropButton_ = new QPushButton("Reset crop", this);
+    cropInfoLabel_ = new QLabel("No crop", this);
+    cropInfoLabel_->setStyleSheet("color:#9cb0c4; font-size: 11px;");
+    cropButton_->setEnabled(false);
+    resetCropButton_->setEnabled(false);
+    connect(cropButton_, &QPushButton::clicked, cropVideoView_,
+            &CropVideoView::beginCropSelection);
+    connect(resetCropButton_, &QPushButton::clicked, cropVideoView_,
+            &CropVideoView::resetCrop);
+    connect(cropVideoView_, &CropVideoView::cropChanged, this,
+            [this](const QRect &rect, bool enabled) {
+              resetCropButton_->setEnabled(enabled);
+              cropInfoLabel_->setText(
+                  enabled
+                      ? QString("Crop: %1 x %2 at (%3, %4)")
+                            .arg(rect.width())
+                            .arg(rect.height())
+                            .arg(rect.x())
+                            .arg(rect.y())
+                      : QString("No crop"));
+              updateButtonStates();
+            });
+    connect(cropVideoView_, &CropVideoView::fileDropped, this,
+            [this](const QString &path) { loadVideoFile(path); });
+    cropRow->addWidget(cropButton_);
+    cropRow->addWidget(resetCropButton_);
+    cropRow->addWidget(cropInfoLabel_);
+    cropRow->addStretch(1);
+    rightLayout->addLayout(cropRow);
 
     auto *controlsGrp = new QGroupBox(this);
     auto *controlsLayout = new QVBoxLayout(controlsGrp);
@@ -1581,12 +1866,6 @@ private:
     footerLayout->addWidget(progressBar_);
     rightLayout->addLayout(footerLayout);
 
-    // QVideoWidget may use a native surface on Windows; keep controls above it.
-    videoFrame->lower();
-    controlsGrp->raise();
-    statusLabel_->raise();
-    progressBar_->raise();
-
     root->addWidget(leftPanel);
     root->addWidget(rightPanel, 1);
 
@@ -1639,7 +1918,7 @@ private:
     auto *dummyAudioOutput = new QAudioOutput(this);
     dummyAudioOutput->setVolume(0.0f);
     player_->setAudioOutput(dummyAudioOutput);
-    player_->setVideoOutput(videoWidget_);
+    player_->setVideoOutput(cropVideoView_->videoItem());
     connect(player_, &QMediaPlayer::positionChanged, this,
             &MainWindow::onPositionChanged);
     connect(player_, &QMediaPlayer::positionChanged, this,
@@ -2325,6 +2604,8 @@ private:
     bool hasMedia = !path.isEmpty() && QFileInfo::exists(path);
     markStartButton_->setEnabled(hasMedia);
     markEndButton_->setEnabled(hasMedia);
+    if (cropButton_)
+      cropButton_->setEnabled(hasMedia);
   }
 
   void refreshMediaLabel() {
@@ -2367,6 +2648,14 @@ private:
     req.mediaInfo = probeMediaInfo(req.path);
     if (!req.mediaInfo.ok)
       return {req, "Unable to read video information"};
+    if (cropVideoView_ && cropVideoView_->hasCrop()) {
+      const QRect crop = cropVideoView_->cropRect();
+      req.cropEnabled = true;
+      req.cropX = crop.x();
+      req.cropY = crop.y();
+      req.cropWidth = crop.width();
+      req.cropHeight = crop.height();
+    }
     if (audioTrackListLayout_) {
       for (auto *row : audioTrackRows()) {
         auto *cb = row->findChild<QCheckBox *>("trackCb");
@@ -2448,6 +2737,13 @@ private:
     previewStartMs_ = 0;
     previewEndMs_ = -1;
     autoEnteredPreviewMode_ = false;
+    const MediaInfo info = probeMediaInfo(path);
+    if (cropVideoView_ && info.ok)
+      cropVideoView_->setSourceSize(QSize(info.width, info.height), true);
+    if (cropInfoLabel_)
+      cropInfoLabel_->setText("No crop");
+    if (resetCropButton_)
+      resetCropButton_->setEnabled(false);
     player_->setSource(QUrl::fromLocalFile(path));
     player_->setPosition(0);
     pendingSeekPosition_ = 0;
@@ -2827,15 +3123,17 @@ private:
   QWidget *audioTrackListWidget_ = nullptr;
   QVBoxLayout *audioTrackListLayout_ = nullptr;
   QLabel *maxSizeLabel_, *infoLabel_, *timeLabel_, *statusLabel_;
+  QLabel *cropInfoLabel_ = nullptr;
   QLabel *previewIndicatorLabel_ = nullptr;
   QFrame *previewBadgeWrap_ = nullptr;
   QPushButton *markStartButton_, *markEndButton_, *runButton_, *previewButton_,
       *backButton_, *playPauseButton_, *stopButton_, *forwardButton_,
       *openOutputButton_ = nullptr, *previewBadgeCloseButton_ = nullptr,
       *selectAllAudioButton_ = nullptr, *deselectAllAudioButton_ = nullptr;
+  QPushButton *cropButton_ = nullptr, *resetCropButton_ = nullptr;
   QWidget *modeSectionWrap_ = nullptr, *sizeRowWrap_ = nullptr,
           *presetWrap_ = nullptr;
-  QVideoWidget *videoWidget_ = nullptr;
+  CropVideoView *cropVideoView_ = nullptr;
   SeekSlider *positionSlider_;
   QPushButton *volumeButton_ = nullptr;
   QWidget *volumePopup_ = nullptr;
