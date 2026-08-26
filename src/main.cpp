@@ -1,4 +1,5 @@
 #include <QGroupBox>
+#include <QtCore/QCoreApplication>
 #include <QtCore/QDateTime>
 #include <QtCore/QDir>
 #include <QtCore/QFileInfo>
@@ -8,6 +9,7 @@
 #include <QtCore/QMap>
 #include <QtCore/QMimeData>
 #include <QtCore/QProcess>
+#include <QtCore/QProcessEnvironment>
 #include <QtCore/QRegularExpression>
 #include <QtCore/QSet>
 #include <QtCore/QSettings>
@@ -223,7 +225,11 @@ public:
 
   void setVolume(float vol) { volume_ = vol; }
   float volume() const { return volume_; }
-  void setMuted(bool muted) { muted_ = muted; }
+  void setMuted(bool muted) {
+    if (muted && !muted_)
+      resetSink();
+    muted_ = muted;
+  }
   bool muted() const { return muted_; }
 
 private:
@@ -247,7 +253,10 @@ private:
       resetSink();
       lastFormat_ = buf.format();
       sink_ = new QAudioSink(lastFormat_, this);
-      sink_->setBufferSize(buf.byteCount() * 8);
+      // Keep the software path responsive. A large queue is audible as an
+      // A/V delay because QAudioBufferOutput is not clocked by QMediaPlayer's
+      // native audio output.
+      sink_->setBufferSize(buf.byteCount() * 2);
       sinkDevice_ = sink_->start();
     }
     if (!sinkDevice_ || !sinkDevice_->isOpen())
@@ -1048,8 +1057,16 @@ private:
   QStringList buildPassCmd(const QString &path, int vk, int ak,
                            const QString &preset, int passNo,
                            const QString &passlog, const QString &scale,
-                           bool includeAudio) const {
+                           bool includeAudio, bool trimInput = false,
+                           bool useOriginalAudioIndices = false) const {
     QStringList cmd{"-y", "-i", path};
+    if (trimInput) {
+      const qint64 startSeconds = mmssToSeconds(req_.startMmss);
+      if (startSeconds > 0)
+        cmd << "-ss" << QString::number(startSeconds);
+      if (req_.durationSeconds > 0)
+        cmd << "-t" << QString::number(req_.durationSeconds);
+    }
     const QString filter = videoFilter(scale);
     if (!filter.isEmpty())
       cmd << "-vf" << filter;
@@ -1062,7 +1079,7 @@ private:
     if (passNo == 1)
       cmd << "-an" << "-f" << "mp4" << "NUL";
     else if (includeAudio)
-      appendSelectedAudioOutput(cmd, ak, false);
+      appendSelectedAudioOutput(cmd, ak, useOriginalAudioIndices);
     else
       cmd << "-an";
     if (passNo != 1) {
@@ -1074,8 +1091,16 @@ private:
 
   QStringList buildSinglePassCmd(const QString &path, int vk, int ak,
                                  const QString &preset, const QString &scale,
-                                 bool includeAudio) const {
+                                 bool includeAudio, bool trimInput = false,
+                                 bool useOriginalAudioIndices = false) const {
     QStringList cmd{"-y", "-i", path};
+    if (trimInput) {
+      const qint64 startSeconds = mmssToSeconds(req_.startMmss);
+      if (startSeconds > 0)
+        cmd << "-ss" << QString::number(startSeconds);
+      if (req_.durationSeconds > 0)
+        cmd << "-t" << QString::number(req_.durationSeconds);
+    }
     const QString filter = videoFilter(scale);
     if (!filter.isEmpty())
       cmd << "-vf" << filter;
@@ -1084,7 +1109,7 @@ private:
         << QString::number(static_cast<int>(std::ceil(vk * 1.2))) + "k"
         << "-bufsize" << QString::number(qMax(vk * 2, 300)) + "k";
     if (includeAudio)
-      appendSelectedAudioOutput(cmd, ak, false);
+      appendSelectedAudioOutput(cmd, ak, useOriginalAudioIndices);
     else
       cmd << "-an";
     cmd << "-movflags" << "+faststart" << outputPath_;
@@ -1121,23 +1146,20 @@ private:
 
   void runCutOnly(int targetDuration) {
     emit status("Input mode: cut only");
-    QStringList cut{"-y", "-ss",
-                    QString::number(mmssToSeconds(req_.startMmss)), "-i",
-                    req_.path};
+    const qint64 startSeconds = mmssToSeconds(req_.startMmss);
+    const bool needsAccurateVideoCut = startSeconds > 0 || req_.cropEnabled;
+    QStringList cut{"-y", "-i", req_.path};
+    if (startSeconds > 0)
+      cut << "-ss" << QString::number(startSeconds);
     if (req_.durationSeconds > 0)
       cut << "-t" << QString::number(req_.durationSeconds);
-    if (req_.cropEnabled) {
-      cut << "-map" << "0:v:0?" << "-vf" << cropFilter() << "-c:v"
-          << "libx264" << "-preset" << "medium" << "-crf" << "18";
-      if (needsRenderedAudioFilter()) {
-        appendSelectedAudioOutput(cut, 192, true);
-      } else if (hasSelectedAudio()) {
-        for (int streamIndex : req_.selectedAudioStreamIndices)
-          cut << "-map" << QString("0:%1").arg(streamIndex);
-        cut << "-c:a" << "copy";
-      } else {
-        cut << "-an";
-      }
+    if (needsAccurateVideoCut) {
+      cut << "-map" << "0:v:0?";
+      if (req_.cropEnabled)
+        cut << "-vf" << cropFilter();
+      cut << "-c:v" << "libx264" << "-preset" << "medium" << "-crf"
+          << "18";
+      appendSelectedAudioOutput(cut, 192, true);
       cut << "-movflags" << "+faststart" << outputPath_;
     } else if (needsRenderedAudioFilter()) {
       cut << "-map" << "0:v:0?" << "-c:v" << "copy";
@@ -1163,28 +1185,8 @@ private:
   }
 
   void runWithPreset(int targetDuration) {
-    QTemporaryDir td(QDir::temp().filePath("video_cut_segment_qt_XXXXXX"));
-    if (!td.isValid()) {
-      emit failed("Unable to create temporary directory");
-      return;
-    }
-    QString cutPath = td.filePath("segment_temp.mp4");
-    QStringList cut{"-y", "-ss",
-                    QString::number(mmssToSeconds(req_.startMmss)), "-i",
-                    req_.path};
-    if (req_.durationSeconds > 0)
-      cut << "-t" << QString::number(req_.durationSeconds);
-    appendSelectedAudioMaps(cut, req_.selectedAudioStreamIndices);
-    cut << "-c" << "copy" << cutPath;
-
-    emit status("Step 1/2  Cutting segment");
-    if (runStep(cut, 0, 2, targetDuration) != 0) {
-      emit failed("Error while creating temporary cut");
-      return;
-    }
-
     QString scale;
-    MediaInfo info = getMediaInfo(cutPath);
+    const MediaInfo &info = req_.mediaInfo;
     const int inputWidth = req_.cropEnabled ? req_.cropWidth : info.width;
     const int inputHeight = req_.cropEnabled ? req_.cropHeight : info.height;
     if (info.ok && req_.presetWidthLimit > 0 &&
@@ -1196,14 +1198,15 @@ private:
     }
 
     emit status(
-        QString("Step 2/2  Preset compression | video %1 kb/s | audio %2 kb/s")
+        QString("Preset compression | video %1 kb/s | audio %2 kb/s")
             .arg(req_.presetVideoKbps)
             .arg(req_.presetAudioKbps));
-    if (runStep(buildSinglePassCmd(cutPath, req_.presetVideoKbps,
+    if (runStep(buildSinglePassCmd(req_.path, req_.presetVideoKbps,
                                    req_.presetAudioKbps,
                                    req_.presetFfmpegPreset, scale,
-                                   !req_.selectedAudioStreamIndices.isEmpty()),
-                1, 2, targetDuration) != 0) {
+                                   !req_.selectedAudioStreamIndices.isEmpty(),
+                                   true, true),
+                0, 1, targetDuration) != 0) {
       emit failed("Error during preset compression");
       return;
     }
@@ -1220,29 +1223,9 @@ private:
 
   void runWithTargetSize(int targetDuration) {
     qint64 targetBytes = static_cast<qint64>(req_.targetMb * 1024.0 * 1024.0);
-    QTemporaryDir td(QDir::temp().filePath("video_cut_segment_qt_XXXXXX"));
-    if (!td.isValid()) {
-      emit failed("Unable to create temporary directory");
-      return;
-    }
-    QString cutPath = td.filePath("segment_temp.mp4");
-    QStringList cut{"-y", "-ss",
-                    QString::number(mmssToSeconds(req_.startMmss)), "-i",
-                    req_.path};
-    if (req_.durationSeconds > 0)
-      cut << "-t" << QString::number(req_.durationSeconds);
-    appendSelectedAudioMaps(cut, req_.selectedAudioStreamIndices);
-    cut << "-c" << "copy" << cutPath;
-
-    emit status("Step 1/2  Cutting segment");
-    if (runStep(cut, 0, 1 + MAX_ATTEMPTS * 2, targetDuration) != 0) {
-      emit failed("Error while creating temporary cut");
-      return;
-    }
-
-    MediaInfo info = getMediaInfo(cutPath);
+    const MediaInfo &info = req_.mediaInfo;
     if (!info.ok) {
-      emit failed("Unable to read temporary segment");
+      emit failed("Unable to read input video");
       return;
     }
 
@@ -1257,7 +1240,7 @@ private:
       return;
     }
     QString passlog = pd.filePath("ffmpeg2pass");
-    int totalSteps = 1 + MAX_ATTEMPTS * 2;
+    int totalSteps = MAX_ATTEMPTS * 2;
 
     for (int a = 0; a < MAX_ATTEMPTS; ++a) {
       const int inputWidth = req_.cropEnabled ? req_.cropWidth : info.width;
@@ -1269,16 +1252,17 @@ private:
                       .arg(MAX_ATTEMPTS)
                       .arg(videoKbps)
                       .arg(audioKbps));
-      int base = 1 + a * 2;
-      if (runStep(buildPassCmd(cutPath, videoKbps, audioKbps, "slow", 1,
-                               passlog, scale, false),
+      int base = a * 2;
+      if (runStep(buildPassCmd(req_.path, videoKbps, audioKbps, "slow", 1,
+                               passlog, scale, false, true, true),
                   base, totalSteps, targetDuration) != 0) {
         emit failed("ffmpeg error during pass 1");
         return;
       }
-      if (runStep(buildPassCmd(cutPath, videoKbps, audioKbps, "slow", 2,
+      if (runStep(buildPassCmd(req_.path, videoKbps, audioKbps, "slow", 2,
                                passlog, scale,
-                               !req_.selectedAudioStreamIndices.isEmpty()),
+                               !req_.selectedAudioStreamIndices.isEmpty(), true,
+                               true),
                   base + 1, totalSteps, targetDuration) != 0) {
         emit failed("ffmpeg error during pass 2");
         return;
@@ -1325,7 +1309,11 @@ public:
     // Intercept drag events from all child widgets
     qApp->installEventFilter(this);
   }
-  ~MainWindow() override { cleanupPreviewTemp(); }
+  ~MainWindow() override {
+    cleanupYoutubeDownloadProcess();
+    cleanupPreviewTemp();
+    cleanupYoutubeTemp(true);
+  }
 
 protected:
   void resizeEvent(QResizeEvent *event) override {
@@ -1334,7 +1322,14 @@ protected:
       cropVideoView_->updateGeometry();
   }
   void closeEvent(QCloseEvent *event) override {
+    if (compressionWorker_) {
+      setStatus("Wait for the current export to finish before closing.");
+      event->ignore();
+      return;
+    }
+    cleanupYoutubeDownloadProcess();
     cleanupPreviewTemp();
+    cleanupYoutubeTemp(true);
     QMainWindow::closeEvent(event);
   }
   void keyPressEvent(QKeyEvent *event) override {
@@ -1476,6 +1471,19 @@ private:
 
     srcGrpLayout->addWidget(makeLabel("File path:"));
     srcGrpLayout->addLayout(fileRow);
+
+    auto *youtubeRow = new QHBoxLayout();
+    youtubeUrlEdit_ = new QLineEdit(this);
+    youtubeUrlEdit_->setPlaceholderText("https://www.youtube.com/watch?v=...");
+    youtubeDownloadButton_ = new QPushButton("Download", this);
+    connect(youtubeUrlEdit_, &QLineEdit::returnPressed, this,
+            &MainWindow::downloadYoutubeVideo);
+    connect(youtubeDownloadButton_, &QPushButton::clicked, this,
+            &MainWindow::downloadYoutubeVideo);
+    youtubeRow->addWidget(youtubeUrlEdit_, 1);
+    youtubeRow->addWidget(youtubeDownloadButton_);
+    srcGrpLayout->addWidget(makeLabel("YouTube URL (temporary download):"));
+    srcGrpLayout->addLayout(youtubeRow);
 
     audioTrackScroll_ = new QScrollArea(this);
     audioTrackScroll_->setObjectName("audioTrackScroll");
@@ -1914,10 +1922,9 @@ private:
   void setupPlayer() {
     mainGainSink_ = new GainAudioSink(this);
     player_ = new QMediaPlayer(this);
-    mainGainSink_->attachTo(player_);
-    auto *dummyAudioOutput = new QAudioOutput(this);
-    dummyAudioOutput->setVolume(0.0f);
-    player_->setAudioOutput(dummyAudioOutput);
+    nativeAudioOutput_ = new QAudioOutput(this);
+    nativeAudioOutput_->setVolume(0.0f);
+    player_->setAudioOutput(nativeAudioOutput_);
     player_->setVideoOutput(cropVideoView_->videoItem());
     connect(player_, &QMediaPlayer::positionChanged, this,
             &MainWindow::onPositionChanged);
@@ -2446,16 +2453,52 @@ private:
     const auto selectedStreams = checkedAudioStreamIndices();
     QSet<int> selectedSet(selectedStreams.begin(), selectedStreams.end());
 
+    if (nativeAudioOutput_)
+      nativeAudioOutput_->setVolume(0.0f);
+
     if (cachedAudioTracks_.isEmpty() || selectedStreams.isEmpty()) {
-      if (mainGainSink_)
-        mainGainSink_->setMuted(true);
+      setMainSoftwareAudioEnabled(false);
       for (auto *s : auxGainSinks_)
         s->setMuted(true);
       return;
     }
 
+    // A single track at up to 100% can use QMediaPlayer's native audio path.
+    // This path shares the player's A/V clock and therefore has no additional
+    // software-buffer delay. Keep GainAudioSink only when amplification or
+    // multi-track mixing is actually required.
+    if (selectedStreams.size() == 1) {
+      const int trackListIndex =
+          audioTrackListIndexForStreamIndex(selectedStreams.first());
+      if (trackListIndex >= 0) {
+        const float gain =
+            globalVolume_ * getTrackVolumeAtIndex(trackListIndex);
+        if (player_->activeAudioTrack() != trackListIndex)
+          player_->setActiveAudioTrack(trackListIndex);
+        for (auto *s : auxGainSinks_)
+          s->setMuted(true);
+        // A slider can easily land a few points above 100%. Keep that small
+        // margin on the native clocked path (clamped to unity) instead of
+        // enabling the higher-latency software amplifier for an inaudible
+        // amount of extra gain.
+        if (gain <= 1.12f) {
+          setMainSoftwareAudioEnabled(false);
+          if (nativeAudioOutput_)
+            nativeAudioOutput_->setVolume(qBound(0.0f, gain, 1.0f));
+        } else {
+          setMainSoftwareAudioEnabled(true);
+          if (mainGainSink_) {
+            mainGainSink_->setMuted(false);
+            mainGainSink_->setVolume(gain);
+          }
+        }
+        return;
+      }
+    }
+
     // Main player always handles audio track index 0 (first in file)
     const int firstStreamIdx = cachedAudioTracks_.first().streamIndex;
+    setMainSoftwareAudioEnabled(true);
     if (mainGainSink_) {
       mainGainSink_->setMuted(!selectedSet.contains(firstStreamIdx));
       mainGainSink_->setVolume(globalVolume_ * getTrackVolumeAtIndex(0));
@@ -2728,12 +2771,16 @@ private:
     return {req, {}};
   }
 
-  void loadVideoFile(const QString &path) {
+  void loadVideoFile(const QString &path, bool preserveYoutubeTemp = false) {
+    if (!preserveYoutubeTemp && youtubeDownloadProcess_)
+      cleanupYoutubeDownloadProcess();
     if (previewRefreshTimer_)
       previewRefreshTimer_->stop();
+    cleanupPreviewTemp();
+    if (!preserveYoutubeTemp)
+      cleanupYoutubeTemp();
     videoPathEdit_->setText(path);
     settings_.setValue("last_video_dir", QFileInfo(path).absolutePath());
-    cleanupPreviewTemp();
     previewStartMs_ = 0;
     previewEndMs_ = -1;
     autoEnteredPreviewMode_ = false;
@@ -2765,6 +2812,239 @@ private:
     if (path.isEmpty())
       return;
     loadVideoFile(path);
+  }
+
+  void setMainSoftwareAudioEnabled(bool enabled) {
+    if (!mainGainSink_ || !player_ || enabled == mainSoftwareAudioEnabled_)
+      return;
+    if (enabled) {
+      mainGainSink_->attachTo(player_);
+      mainGainSink_->setMuted(false);
+    } else {
+      mainGainSink_->detach();
+    }
+    mainSoftwareAudioEnabled_ = enabled;
+  }
+
+  QString findYtDlpExecutable() const {
+    const QString appCopy =
+        QDir(QCoreApplication::applicationDirPath()).filePath("yt-dlp.exe");
+    if (QFileInfo::exists(appCopy))
+      return appCopy;
+    const QString developmentCopy =
+        QDir::current().filePath(".cache/yt-dlp/yt-dlp.exe");
+    if (QFileInfo::exists(developmentCopy))
+      return developmentCopy;
+    QString executable = QStandardPaths::findExecutable("yt-dlp");
+#ifdef Q_OS_WIN
+    if (executable.isEmpty())
+      executable = QStandardPaths::findExecutable("yt-dlp.exe");
+#endif
+    return executable;
+  }
+
+  bool isYoutubeUrl(const QUrl &url) const {
+    if (!url.isValid() ||
+        (url.scheme() != "http" && url.scheme() != "https"))
+      return false;
+    const QString host = url.host().toLower();
+    return host == "youtu.be" || host == "youtube.com" ||
+           host.endsWith(".youtube.com");
+  }
+
+  void consumeYoutubeOutput(const QByteArray &bytes, bool flush = false) {
+    youtubeOutputBuffer_ += QString::fromUtf8(bytes);
+    int newline = -1;
+    while ((newline = youtubeOutputBuffer_.indexOf('\n')) >= 0) {
+      const QString line = youtubeOutputBuffer_.left(newline).trimmed();
+      youtubeOutputBuffer_.remove(0, newline + 1);
+      handleYoutubeOutputLine(line);
+    }
+    if (flush && !youtubeOutputBuffer_.trimmed().isEmpty()) {
+      handleYoutubeOutputLine(youtubeOutputBuffer_.trimmed());
+      youtubeOutputBuffer_.clear();
+    }
+  }
+
+  void handleYoutubeOutputLine(const QString &line) {
+    if (line.startsWith("FILE:")) {
+      youtubeDownloadedPath_ = line.mid(5).trimmed();
+      return;
+    }
+    static const QRegularExpression progressRx(
+        R"(PROGRESS:\s*([0-9]+(?:\.[0-9]+)?)%)");
+    const auto match = progressRx.match(line);
+    if (match.hasMatch()) {
+      const double rawPercent = match.captured(1).toDouble();
+      if (youtubeLastRawPercent_ > 90.0 &&
+          rawPercent + 20.0 < youtubeLastRawPercent_)
+        youtubeDownloadPhase_ = 1;
+      youtubeLastRawPercent_ = rawPercent;
+      const double combinedPercent =
+          youtubeDownloadPhase_ == 0 ? rawPercent * 0.5
+                                     : 50.0 + rawPercent * 0.5;
+      const int percent = qBound(
+          0, static_cast<int>(std::round(combinedPercent)), 100);
+      progressBar_->setValue(percent);
+      setStatus(QString("Downloading YouTube video... %1%").arg(percent));
+    }
+  }
+
+  void setYoutubeDownloadUiBusy(bool busy) {
+    if (youtubeDownloadButton_)
+      youtubeDownloadButton_->setEnabled(!busy);
+    if (youtubeUrlEdit_)
+      youtubeUrlEdit_->setEnabled(!busy);
+  }
+
+  QString findDownloadedYoutubeFile() const {
+    if (!youtubeTempDir_)
+      return {};
+    const QFileInfoList files = QDir(youtubeTempDir_->path()).entryInfoList(
+        {"*.mp4", "*.mkv", "*.webm", "*.mov", "*.avi"}, QDir::Files,
+        QDir::Size | QDir::Reversed);
+    return files.isEmpty() ? QString() : files.first().absoluteFilePath();
+  }
+
+  QString youtubeFailureDetail() const {
+    const QStringList lines =
+        youtubeErrorOutput_.split('\n', Qt::SkipEmptyParts);
+    for (auto it = lines.crbegin(); it != lines.crend(); ++it) {
+      const QString line = it->trimmed();
+      if (!line.isEmpty() && !line.startsWith("FILE:") &&
+          !line.startsWith("PROGRESS:"))
+        return line;
+    }
+    return "unknown yt-dlp error";
+  }
+
+  void downloadYoutubeVideo() {
+    if (youtubeDownloadProcess_)
+      return;
+    if (compressionWorker_) {
+      setStatus("Wait for the current export to finish.");
+      return;
+    }
+
+    const QUrl url = QUrl::fromUserInput(youtubeUrlEdit_->text().trimmed());
+    if (!isYoutubeUrl(url)) {
+      setStatus("Enter a valid YouTube URL.");
+      return;
+    }
+    const QString ytDlp = findYtDlpExecutable();
+    if (ytDlp.isEmpty()) {
+      setStatus("yt-dlp.exe was not found. Rebuild the complete installer or "
+                "place it next to the application.");
+      return;
+    }
+
+    cleanupYoutubeTemp();
+    youtubeTempDir_ = new QTemporaryDir(
+        QDir::temp().filePath("video_cut_youtube_XXXXXX"));
+    if (!youtubeTempDir_->isValid()) {
+      delete youtubeTempDir_;
+      youtubeTempDir_ = nullptr;
+      setStatus("Unable to create the temporary YouTube directory.");
+      return;
+    }
+
+    youtubeDownloadedPath_.clear();
+    youtubeOutputBuffer_.clear();
+    youtubeErrorOutput_.clear();
+    youtubeDownloadPhase_ = 0;
+    youtubeLastRawPercent_ = 0.0;
+    youtubeDownloadProcess_ = new QProcess(this);
+    QProcessEnvironment environment = QProcessEnvironment::systemEnvironment();
+    environment.insert("PYTHONUTF8", "1");
+    environment.insert("PYTHONIOENCODING", "utf-8");
+    youtubeDownloadProcess_->setProcessEnvironment(environment);
+    youtubeDownloadProcess_->setProcessChannelMode(QProcess::MergedChannels);
+    connect(youtubeDownloadProcess_, &QProcess::readyReadStandardOutput, this,
+            [this]() {
+              const QByteArray output =
+                  youtubeDownloadProcess_->readAllStandardOutput();
+              youtubeErrorOutput_ += QString::fromUtf8(output);
+              if (youtubeErrorOutput_.size() > 6000)
+                youtubeErrorOutput_ = youtubeErrorOutput_.right(6000);
+              consumeYoutubeOutput(output);
+            });
+    connect(youtubeDownloadProcess_, &QProcess::errorOccurred, this,
+            [this](QProcess::ProcessError error) {
+              if (error != QProcess::FailedToStart)
+                return;
+              setYoutubeDownloadUiBusy(false);
+              setProgressVisible(false);
+              setStatus("Unable to start yt-dlp.exe.");
+              youtubeDownloadProcess_->deleteLater();
+              youtubeDownloadProcess_ = nullptr;
+              cleanupYoutubeTemp();
+            });
+    connect(
+        youtubeDownloadProcess_,
+        qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this,
+        [this](int exitCode, QProcess::ExitStatus exitStatus) {
+          const QByteArray finalOutput =
+              youtubeDownloadProcess_->readAllStandardOutput();
+          youtubeErrorOutput_ += QString::fromUtf8(finalOutput);
+          consumeYoutubeOutput(finalOutput, true);
+          youtubeDownloadProcess_->deleteLater();
+          youtubeDownloadProcess_ = nullptr;
+          setYoutubeDownloadUiBusy(false);
+
+          if (youtubeDownloadedPath_.isEmpty() ||
+              !QFileInfo::exists(youtubeDownloadedPath_))
+            youtubeDownloadedPath_ = findDownloadedYoutubeFile();
+
+          if (exitStatus != QProcess::NormalExit || exitCode != 0 ||
+              youtubeDownloadedPath_.isEmpty() ||
+              !QFileInfo::exists(youtubeDownloadedPath_)) {
+            setStatus("YouTube download failed: " + youtubeFailureDetail());
+            setProgressVisible(false);
+            cleanupYoutubeTemp();
+            return;
+          }
+
+          const QString downloadedPath = youtubeDownloadedPath_;
+          loadVideoFile(downloadedPath, true);
+          setStatus("YouTube video downloaded temporarily and loaded.");
+        });
+
+    const QString outputTemplate = QDir(youtubeTempDir_->path()).filePath(
+        "%(title).150B [%(id)s].%(ext)s");
+    QString ffmpegLocation = QCoreApplication::applicationDirPath();
+    if (!QFileInfo::exists(QDir(ffmpegLocation).filePath("ffmpeg.exe"))) {
+      const QString developmentFfmpeg =
+          QDir::current().filePath(".cache/ffmpeg/bin");
+      if (QFileInfo::exists(QDir(developmentFfmpeg).filePath("ffmpeg.exe")))
+        ffmpegLocation = developmentFfmpeg;
+    }
+    const QStringList arguments = {
+        "--no-playlist",
+        "--no-simulate",
+        "--newline",
+        "--progress",
+        "--no-color",
+        "--windows-filenames",
+        "--merge-output-format",
+        "mkv",
+        "--ffmpeg-location",
+        ffmpegLocation,
+        "-f",
+        "bv*+ba/b",
+        "-o",
+        outputTemplate,
+        "--progress-template",
+        "download:PROGRESS:%(progress._percent_str)s",
+        "--print",
+        "after_move:FILE:%(filepath)s",
+        url.toString(QUrl::FullyEncoded)};
+
+    progressBar_->setRange(0, 100);
+    progressBar_->setValue(0);
+    setProgressVisible(true);
+    setYoutubeDownloadUiBusy(true);
+    setStatus("Starting YouTube download...");
+    youtubeDownloadProcess_->start(ytDlp, arguments);
   }
 
   void startPreview() {
@@ -2811,7 +3091,21 @@ private:
     QString mode = req.compressMode == "target_size" ? "compressed_size"
                    : req.compressMode == "preset"    ? "compressed_preset"
                                                      : "cut_source";
-    QString out = buildOutputPath(req.path, s, e + "_" + mode);
+    QString outputSourcePath = req.path;
+    if (!youtubeDownloadedPath_.isEmpty() &&
+        QFileInfo(req.path) == QFileInfo(youtubeDownloadedPath_)) {
+      QString outputDir =
+          QStandardPaths::writableLocation(QStandardPaths::MoviesLocation);
+      if (outputDir.isEmpty())
+        outputDir =
+            QStandardPaths::writableLocation(QStandardPaths::DownloadLocation);
+      if (outputDir.isEmpty())
+        outputDir = QDir::currentPath();
+      QDir().mkpath(outputDir);
+      outputSourcePath =
+          QDir(outputDir).filePath(QFileInfo(req.path).fileName());
+    }
+    QString out = buildOutputPath(outputSourcePath, s, e + "_" + mode);
     pendingOutputPath_ = out;
     if (openOutputButton_)
       openOutputButton_->setVisible(false);
@@ -2833,6 +3127,9 @@ private:
       runButton_->setEnabled(true);
       compressionWorker_->deleteLater();
       compressionWorker_ = nullptr;
+      if (youtubeTempDir_ &&
+          videoPathEdit_->text().trimmed() != youtubeDownloadedPath_)
+        cleanupYoutubeTemp();
     });
     compressionWorker_->start();
   }
@@ -2911,16 +3208,27 @@ private:
     }
     if (pendingSeekPosition_.has_value()) {
       qint64 target = *pendingSeekPosition_;
-      if (std::llabs(p - target) <= 80) {
+      const bool crossedTarget =
+          (pendingSeekDirection_ > 0 && p >= target) ||
+          (pendingSeekDirection_ < 0 && p <= target);
+      if (std::llabs(p - target) <= 250 || crossedTarget) {
         pendingSeekPosition_.reset();
         pendingSeekDirection_ = 0;
         lastSeekRetryMs_ = 0;
+        seekRetryCount_ = 0;
       } else {
         p = target;
         qint64 now = QDateTime::currentMSecsSinceEpoch();
-        if (!sliderDragging_ && (now - lastSeekRetryMs_) >= 120) {
+        if (!sliderDragging_ && seekRetryCount_ < 1 &&
+            (now - lastSeekRetryMs_) >= 600) {
           player_->setPosition(target);
           lastSeekRetryMs_ = now;
+          ++seekRetryCount_;
+        } else if (seekRetryCount_ >= 1 &&
+                   (now - lastSeekRetryMs_) >= 1200) {
+          pendingSeekPosition_.reset();
+          pendingSeekDirection_ = 0;
+          seekRetryCount_ = 0;
         }
       }
     }
@@ -2980,7 +3288,8 @@ private:
     pendingSeekDirection_ =
         absoluteTarget > cur ? 1 : (absoluteTarget < cur ? -1 : 0);
     pendingSeekPosition_ = absoluteTarget;
-    lastSeekRetryMs_ = 0;
+    lastSeekRetryMs_ = QDateTime::currentMSecsSinceEpoch();
+    seekRetryCount_ = 0;
     player_->setPosition(absoluteTarget);
   }
 
@@ -3061,6 +3370,36 @@ private:
       QDesktopServices::openUrl(QUrl::fromLocalFile(folder));
   }
 
+  void cleanupYoutubeDownloadProcess() {
+    if (!youtubeDownloadProcess_)
+      return;
+    disconnect(youtubeDownloadProcess_, nullptr, this, nullptr);
+    if (youtubeDownloadProcess_->state() != QProcess::NotRunning) {
+      youtubeDownloadProcess_->kill();
+      youtubeDownloadProcess_->waitForFinished(3000);
+    }
+    delete youtubeDownloadProcess_;
+    youtubeDownloadProcess_ = nullptr;
+    setYoutubeDownloadUiBusy(false);
+  }
+
+  void cleanupYoutubeTemp(bool force = false) {
+    if (!youtubeTempDir_)
+      return;
+    if (compressionWorker_ && !force)
+      return;
+    if (player_ && !youtubeDownloadedPath_.isEmpty() &&
+        player_->source() == QUrl::fromLocalFile(youtubeDownloadedPath_)) {
+      player_->stop();
+      player_->setSource({});
+    }
+    delete youtubeTempDir_;
+    youtubeTempDir_ = nullptr;
+    youtubeDownloadedPath_.clear();
+    youtubeOutputBuffer_.clear();
+    youtubeErrorOutput_.clear();
+  }
+
   void cleanupPreviewTemp() {
     if (previewRefreshTimer_)
       previewRefreshTimer_->stop();
@@ -3096,28 +3435,38 @@ private:
   QString cachedAudioPath_;
   QString pendingOutputPath_;
   QString lastOutputPath_;
+  QString youtubeDownloadedPath_;
+  QString youtubeOutputBuffer_;
+  QString youtubeErrorOutput_;
   MediaInfo cachedMediaInfo_;
   QVector<AudioTrackInfo> cachedAudioTracks_;
   QTimer *mediaInfoTimer_ = nullptr;
   QTimer *previewRefreshTimer_ = nullptr;
   CompressionWorker *compressionWorker_ = nullptr;
+  QProcess *youtubeDownloadProcess_ = nullptr;
+  QTemporaryDir *youtubeTempDir_ = nullptr;
   GainAudioSink *mainGainSink_ = nullptr;
   QVector<QMediaPlayer *> auxAudioPlayers_;
   QVector<GainAudioSink *> auxGainSinks_;
   bool sliderDragging_ = false;
   float globalVolume_ = 1.0f;
   bool previewModeEnabled_ = false;
+  bool mainSoftwareAudioEnabled_ = false;
   bool autoEnteredPreviewMode_ = false;
   bool pendingPreviewAutoPlay_ = false;
   std::optional<qint64> pendingSeekPosition_;
   int pendingSeekDirection_ = 0;
   qint64 lastSeekRetryMs_ = 0;
+  int seekRetryCount_ = 0;
   qint64 previewStartMs_ = 0;
   qint64 previewEndMs_ = -1;
   qint64 pendingPreviewDisplayPos_ = 0;
+  int youtubeDownloadPhase_ = 0;
+  double youtubeLastRawPercent_ = 0.0;
 
   QLineEdit *videoPathEdit_, *startEdit_, *endEdit_, *maxSizeEdit_,
       *presetVideoKbpsEdit_, *presetAudioKbpsEdit_, *presetWidthLimitEdit_;
+  QLineEdit *youtubeUrlEdit_ = nullptr;
   QComboBox *modeCombo_, *presetCombo_, *presetFfmpegCombo_;
   QScrollArea *audioTrackScroll_ = nullptr;
   QWidget *audioTrackListWidget_ = nullptr;
@@ -3131,6 +3480,7 @@ private:
       *openOutputButton_ = nullptr, *previewBadgeCloseButton_ = nullptr,
       *selectAllAudioButton_ = nullptr, *deselectAllAudioButton_ = nullptr;
   QPushButton *cropButton_ = nullptr, *resetCropButton_ = nullptr;
+  QPushButton *youtubeDownloadButton_ = nullptr;
   QWidget *modeSectionWrap_ = nullptr, *sizeRowWrap_ = nullptr,
           *presetWrap_ = nullptr;
   CropVideoView *cropVideoView_ = nullptr;
@@ -3143,6 +3493,7 @@ private:
   QIcon playIcon_, pauseIcon_, volumeIcon_, mutedIcon_;
 
   QMediaPlayer *player_ = nullptr;
+  QAudioOutput *nativeAudioOutput_ = nullptr;
 };
 
 int main(int argc, char *argv[]) {
